@@ -1,0 +1,399 @@
+---
+title: "Microarreglos: Complementos al Flujo de trabajo de `Bioconductor`"
+author: "avallecam@gmail.com"
+date: "2017-08-04"
+output:
+  #html_document:
+  #pdf_document:
+  html_notebook:
+    toc: yes
+    toc_depth: 5
+    toc_float:
+      collapsed: yes
+    #theme: united
+    #code_folding: "hide"
+    #fig_caption: TRUE
+    #number_sections: TRUE
+bibliography: malaria.bib
+link-citations: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+options(width = 90) # expand limits of CONSOLE output
+```
+
+La primera parte del presente tutorial construye gráficas para la interpretación de los resultados de la publicación del 
+capítulo [limma](https://kasperdanielhansen.github.io/genbioconductor/html/limma.html) 
+del curso
+[Bioconductor for Genomic Data Science](https://kasperdanielhansen.github.io/genbioconductor/) 
+de [Kasper Daniel Hansen](http://www.hansenlab.org/).
+
+## Objetivo
+
+- Complementar el flujo de trabajo de `Bioconductor` para el análisis de microarreglos.
+
+__Nota:__ Todos los outputs deben verse como líneas corridas. _Disminuir el zoom de ser necesario._
+
+## Dependencies
+```{r, message=FALSE,warning=FALSE}
+library(tidyverse)
+library(ggrepel)
+library(Biobase)
+library(limma)
+library(NMF)
+library(leukemiasEset)
+```
+
+## Data input
+
+La data ha sido adquirida por:
+
+- Data disponible del paquete `leukemiaEset`
+
+```{r, eval=FALSE, echo=TRUE}
+data(leukemiasEset)
+leukeset <- leukemiasEset
+```
+
+Ambas bases han sido grabadas en un formato `.rds` con la función `saveRDS()` para facilitar su distribución y acceso.
+```{r,eval=FALSE, echo=TRUE}
+saveRDS(leukeset, "data-raw/leukeset.rds")
+```
+
+Por ello, la importación de ambas bases será ejecutada por la función `readRDS()`.
+```{r}
+leukeset <- readRDS("data-raw/leukeset.rds")
+```
+
+## DNA microarray: Leukemia
+
+__Contexto:__
+
+- This is data on different types of leukemia.  The code `NoL` means not leukemia, ie. normal controls.
+
+### Problema
+
+- Which genes are differentially expressed between the `ALL` type and normal controls?
+
+### ExpressionSet
+
+El presente ejemplo nos brinda un `ExpressionSet()`, el cual es un contenedor de datos que integra:
+
+- Data de __expresión__, accesible con la función `exprs()`, y
+- Data de las __muestras__ o covariables, accesible con la función `pData()`.
+
+```{r}
+leukemiasEset <- leukeset
+leukemiasEset
+```
+
+### Differential expression
+
+#### Define the control group
+
+- First we subset the data and clean it up.
+- Then, define the control group
+
+```{r}
+eset <- leukemiasEset[, leukemiasEset$LeukemiaType %in% c("ALL", "NoL")]
+eset$LeukemiaType <- factor(eset$LeukemiaType)
+
+table(eset$LeukemiaType) # debe ser: control (fct referencia) vs caso
+eset$LeukemiaType <- relevel(eset$LeukemiaType, ref = "NoL")
+table(eset$LeukemiaType) # debe ser: control (fct referencia) vs caso
+```
+
+#### Matrix + Linear model + eBayes
+
+`limma` ayuda a resolver dos principales problemas:
+
+- presencia de varianzas artificialmente altas o bajas producto del 
+bajo número de réplicas entre arreglos o muestras [@baldi2001cybert]; y un
+- presencia de falsos positivos producto al amplio número de hipótesis 
+puestas a prueba en forma simultánea [@kayala2012cyber].
+
+1. Un __test-t empírico de Bayes__ permite reducir (o moderar) las varianzas de 
+todas las lecturas.
+    - `cyber-t` actualiza la varianza observada de cada gen asumiendo como la probabilidad previa (_prior_) 
+    que la varianza de genes vecinos con medias de expresión similar [@baldi2001cybert].
+    - `limma` optimizó y generalizó esta estrategia a distintos diseños experimentales. 
+    Asume una varianza general como _prior_ para la actualización de todas las varianzas 
+    observadas [@smyth2004ebayes].
+    
+    __Nota:__ A diferencia de un enfoque bayesiano puro, donde se asume una 
+    probabilidad previa para la actualización de un evento (condicionado) dado un evento condicionante,
+    en un enfoque empírico esta información es obtenida de un _pool_ de
+    elementos observados en el mismo experimento.
+    
+2. Los métodos de __corrección o ajuste de valores p__ permiten que el 
+controlar la razón de falsos positivos con 
+respecto a todos los descubrimientos o razón de falsos descubrimientos 
+(FDR) [@brazma2001].
+    - El método Benjamini-Hochberg determina un valor crítico de valores p dependiente del total 
+de hipótesis puestas a prueba y el valor de FDR deseado [@benjamini1995fdr].
+
+Ambas propiedades son revisadas [aquí](http://genomicsclass.github.io/book/pages/using_limma.html).
+
+```{r, message=FALSE, eval=FALSE, echo=FALSE}
+design <- model.matrix(~ eset$LeukemiaType)
+
+eb <- eset %>% 
+  lmFit(design) %>% 
+  eBayes()
+
+eb %>% topTable()
+```
+
+```{r}
+design <- model.matrix(~ eset$LeukemiaType)
+fit <- lmFit(eset, design)
+eb <- eBayes(fit)
+topTable(eb) %>% rownames_to_column()
+```
+
+The output from `topTable()` includes
+
+- `logFC`: the log fold-change between cases and controls.
+- `t`: the t-statistic used to assess differential expression.
+- `P.Value`: the p-value for differential expression; this value is not adjusted for multiple testing.
+- `adj.P.Val`: the p-value adjusted for multiple testing.   Different adjustment methods are available, the default is Benjamini-Horchberg.
+
+```{r}
+# tidy toptable
+td <- topTable(eb, coef = 2,               # default: slope
+         sort.by =NULL, resort.by =NULL, 
+         #genelist = NULL,                 # no fit$gene
+         number = Inf,                     # show all the hipothesis
+         confint=0.95) %>% rownames_to_column() %>% as.tbl() %>% 
+  dplyr::rename(Gene.ID=rowname)
+```
+
+```{r, eval=FALSE, echo=FALSE}
+# explore the toptable
+
+topTable(eb, coef = 2, 
+         # interesting sorting: 1st: significance, then: effect
+         sort.by ="P", resort.by ="logFC",
+         number = Inf, 
+         confint=0.95)
+
+#topTable(eb, coef = c(1,2), number = Inf) %>% 
+#  as.data.frame() %>% rownames_to_column() %>% as.tibble() %>% 
+#  arrange(rowname)
+#coef(eb) %>% 
+#  as.data.frame() %>% rownames_to_column() %>% as.tibble() %>% 
+#  arrange(rowname)
+
+```
+
+### Plots
+
+```{r, eval=FALSE, echo=FALSE}
+
+#### variance shrinkage
+
+par(mfrow=c(1,2))
+plot(eb$Amean, eb$sigma)
+plot(eb$Amean, eb$s2.post)
+```
+
+```{r, fig.height=8, fig.width=8, message=FALSE, echo=FALSE, eval=FALSE}
+x <- eb %>% biobroom::augment.MArrayLM() %>% ## ERROR in function!! s2.prior!!
+  inner_join(
+    inner_join(eb$Amean %>% 
+               as.tibble() %>% 
+               tibble::rownames_to_column() %>% 
+               dplyr::rename(.AMean=value,
+                             .gene=rowname),
+               eb$s2.post %>% 
+               as.tibble() %>% 
+               tibble::rownames_to_column() %>% 
+               dplyr::rename(s2.post=value,
+                             .gene=rowname),
+               by=".gene"),
+             by=".gene") 
+
+m <- x %>% 
+  ggplot(aes(.AMean,.sigma))+
+  geom_hex()+scale_y_continuous(limits = c(-0.2,9))
+  #geom_density2d()
+
+n <- x %>% 
+  ggplot(aes(.AMean,s2.post))+
+  geom_hex()+scale_y_continuous(limits = c(-0.2,9))
+  #geom_density2d()#
+
+o <- x %>% 
+  ggplot(aes(.AMean,.sigma))+
+  #geom_hex()+scale_y_continuous(limits = c(-0.2,9))
+  geom_density2d()#+
+  #scale_y_continuous(limits = c(-0.05,0.7))+
+  #scale_x_continuous(limits = c(-0.05,15))
+
+p <- x %>% 
+  ggplot(aes(.AMean,s2.post))+
+  #geom_hex()
+  geom_density2d()#+
+  #scale_y_continuous(limits = c(-0.05,0.7))+
+  #scale_x_continuous(limits = c(-0.05,15))
+
+Rmisc::multiplot(m,n,o,p,cols = 2)
+```
+
+#### p-value histogram
+
+- useful to check prior to execution of a multiple comparison correction.
+
+- El comportamiento de esta corrección puede inferirse preliminarmente al observar la ditribución de valores p en un histograma. 
+- Corroborar que la proporción de valores p ajustados menores al nivel de FDR deseado será igual a la proporción de valores p menores al nivel de significancia que estén sobre la distribución de las hipótesis nulas no rechazadas.
+- __Comparar con el siguiente caso__
+
+```{r}
+test <- topTable(eb, coef = 2,
+                 sort.by ="P", 
+                 #sort.by ="AveExpr", 
+                 genelist = fit$genes$Gene.ID, number = Inf)
+library(ggplot2)
+ax <- qplot(test$P.Value, binwidth=.05)
+bx <- qplot(test$adj.P.Val, binwidth=.05)
+Rmisc::multiplot(ax,bx,cols = 2)
+```
+
+
+```{r, eval=FALSE, fig.align="center", echo=FALSE}
+
+#### base R volcano plot
+
+# (2) Volcano plot: Log Fold Change x -log10(p.value)
+#source: http://genomicsclass.github.io/book/pages/using_limma.html
+
+#
+par(mfrow=c(1,2))
+with(td, plot(logFC, -log10(P.Value),cex=.7, pch=20,
+                    main = "caso vs control",
+                    #col=cols,
+                    #xlim=c(-2,2), ylim=c(0,15),
+                    xlab="log Fold Change"))
+abline(h=c(-log10(0.05),-log10(1e-13)),
+       v=c(-1,1),
+       lty=2, col= "grey55")
+```
+
+<!--
+h<-topTable(eb, coef = 2, 
+            sort.by =NULL, resort.by =NULL, 
+            genelist = NULL, 
+            number = Inf, 
+            confint=0.95)
+h<-h[rownames(coef(eb)),]
+td <- data.frame(Gene.ID=dimnames(eb$coefficients)[[1]],logFC=coef(eb)[,2],AveExpr=h$AveExpr, p.value=eb$p.value[,2], padj=h$adj.P.Val, B=h$B)
+-->
+
+#### volcano plot
+
+- Visualizacióń del efecto del caso sobre el control (logFC) por su significancia estadística.
+
+- tutorial [aquí](http://www.gettinggeneticsdone.com/2016/01/repel-overlapping-text-labels-in-ggplot2.html)
+
+```{r, echo=TRUE}
+# (2) Volcano plot: Log Fold Change x -log10(p.value)
+
+td %>% 
+  mutate(significance=if_else(P.Value<1e-13,
+                              "p.adj < 1e-13","diff rve")) %>% 
+  ggplot(aes(logFC,-log10(P.Value))) +
+  geom_point(aes(colour=significance)) +
+  scale_color_manual(values=c("black","red")) +
+  ggrepel::geom_text_repel(data = filter(td, 
+                                         P.Value<1e-14 | P.Value<1e-13 & logFC>0),
+                           aes(label=Gene.ID)) +
+  labs(title="Leukemia DNA microarray",
+       subtitle="Caso vs Control")
+```
+
+#### heatmap + hierachical clustering
+
+La inferencia estadística es comúnmente complementada con técnicas de clasificación.
+
+1. La clasificación __supervisada__ o predicción de clase, define _a priori_ 
+el número de categorías, el conjunto de entrenamiento y el de prueba. Ejemplos:
+_support vector machines_ (SVM), _k-nearest neighbors_ (k-NN) y validación
+por _leave-one-out cross-validation_ (LOOCV).
+
+2. La clasificación __no-supervisada__ o descubrimiento de clase, agrupa objetos 
+en base a métricas de similaridad de los objetos a lo largo de las muestras.
+Requiere definir 2 tipos de algoritmos: 
+    
+    - de distancia: e.g., Euclidiana, en la que se prioriza la 
+    magnitud sobre la dispersión de las señales, y la correlación de 
+    Pearson, en la que se prioriza la dispersión sobre la magnitud.
+    
+    - de agrupamiento: e.g., agrupamiento jerárquico o _hierarchical clustering_,
+    en la que los racimos o _clusters_ se forman iterativamente al calcular 
+    la distancia entre elementos y racimos en formación. 
+    Más detalles, [aquí](bonsai.hgc.jp/~mdehoon/software/cluster/cluster3.pdf). 
+    Otros son el 
+    _k-mean clustering_, _self-organizing maps_ (SOM) y 
+    _principal component analysis_ (PCA).
+    
+    > Las principales desventajas de la técnica están en el requerimiento 
+    de decisiones entre varios algoritmos sin consenso y su escasa reproducibilidad
+    entre experimentos. [@allison2006]
+
+```{r, fig.height=7, fig.width=10, fig.align="center"}
+#eset <- eset#leukemiasEset
+#exprs(eset) %>% dim()
+x <- td %>% 
+  arrange(desc(t)) %>% 
+  filter(B>0 & adj.P.Val<1e-10) %>% 
+  select(Gene.ID) %>% as.matrix() 
+#x %>% dim()
+#%>% dim()
+aheatmap(exprs(eset)[x,], 
+         Rowv = TRUE, Colv = TRUE, 
+         annCol = pData(eset), 
+         #layout = "_"
+         )
+```
+
+```{r, eval=FALSE, echo=FALSE}
+#### boxplots
+biobroom::tidy.ExpressionSet(eset,addPheno = TRUE) %>% 
+  ggplot(aes(reorder(gene,value,order = TRUE),value,fill=LeukemiaType))+
+  geom_boxplot()+
+  #geom_point() +
+  ylab("log2-transformed normalized MFI")+
+  xlab("antigens")+
+  labs(title="Differentian reactivity of antibodies",
+       subtitle="filtered by B>0 (~adj.P.Val<0.01) and sorted w.r.t. median Ab reactivity per gene")+
+  coord_flip() # ORDENAR eje de proteínas!!!!
+```
+
+
+## Conclusión: aplica el `tidyverse` antes y después de `Bioconductor`
+
+- Al igual que en los casos presentados en los tutoriales anteriores, el dialecto del `tidyverse` facilitó tanto el ingreso de data para la ejecución de modelos en `Bioconductor`, como para "limpiar" sus resultados y generar en forma intuitiva visualizaciones que ayuden a su interpretación.
+
+- El análisis presentado sigue el flujo de trabajo propuesto por David Robinson:
+
+![workflow](figure/tidy_01.jpg)
+
+## EXTRA TOOL: `biobroom` y `ExpressionSet_tidiers`
+
+- `biobroom` incluye "tidiers" para varias estructuras de datos de Bioconductor. Revísalo [aquí](http://bioconductor.org/packages/release/bioc/vignettes/biobroom/inst/doc/biobroom_vignette.html).
+
+- ¿Tarea? Ponerlo en práctica con sus ejemplos de RNA-seq :)
+
+```{r}
+#exprs(eset)
+#pData(eset) %>% rownames_to_column() %>% arrange(phenotype)
+biobroom::tidy.ExpressionSet(eset,addPheno = TRUE)
+```
+
+## Computer environment
+```{r}
+devtools::session_info()
+```
+
+## References

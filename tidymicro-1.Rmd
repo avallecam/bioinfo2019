@@ -1,0 +1,457 @@
+---
+title: "Caso I: Limpieza y Visualización de data genómica"
+author: "avallecam"
+date: '`r Sys.Date()`'
+output:
+  #html_document:
+  #pdf_document:
+  html_notebook:
+    toc: yes
+    toc_depth: 3
+    toc_float:
+      collapsed: yes
+    #theme: united
+    #code_folding: "hide"
+    #fig_caption: TRUE
+    #number_sections: TRUE
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+options(width = 90) # expand limits of CONSOLE output
+```
+
+El presente tutorial está basado en la [publicación](http://varianceexplained.org/r/tidy-genomics/) del 
+blog [variance explained](http://varianceexplained.org/) 
+de [David Robinson](https://twitter.com/drob).
+El material ha sido actualizado y adaptado al objetivo del curso.
+
+## Objetivo
+
+- Aplicar las herramientas y estilo del `tidyverse` en la limpieza, exploración y visualización de datos genómicos.
+
+__Nota:__ Todos los outputs deben verse como líneas corridas. _Disminuir el zoom de ser necesario._
+
+## Dependencies
+```{r, message=FALSE,warning=FALSE}
+library(tidyverse)
+```
+
+## Contexto: Expresión de genes en inanición
+
+Through the process of gene regulation, a cell can control which genes are transcribed from DNA to RNA- what we call being “expressed”. (If a gene is never turned into RNA, it may as well not be there at all). This provides a sort of “cellular switchboard” that can activate some systems and deactivate others, which can speed up or slow down growth, switch what nutrients are transported into or out of the cell, and respond to other stimuli. A gene expression microarray lets us measure how much of each gene is expressed in a particular condition. We can use this to figure out the function of a specific gene (based on when it turns on and off), or to get an overall picture of the cell’s activity.
+
+Brauer 2008 used microarrays to test the effect of starvation and growth rate on baker’s yeast (S. cerevisiae, a popular model organism for studying molecular genomics because of its simplicity)1. Basically, if you give yeast plenty of nutrients (a rich media), except that you sharply restrict its supply of one nutrient, you can control the growth rate to whatever level you desire (we do this with a tool called a chemostat). For example, you could limit the yeast’s supply of glucose (sugar, which the cell metabolizes to get energy and carbon), of leucine (an essential amino acid), or of ammonium (a source of nitrogen).
+
+“Starving” the yeast of these nutrients lets us find genes that:
+
+- __Raise or lower their activity in response to growth rate.__ Growth-rate dependent expression patterns can tell us a lot about cell cycle control, and how the cell responds to stress.
+- __Respond differently when different nutrients are being limited.__ These genes may be involved in the transport or metabolism of those nutrients.
+
+Sounds pretty cool, right? So let’s get started!
+
+## Importar
+
+```{r, eval=FALSE, echo=FALSE}
+library(readr)
+original_data <- readr::read_delim("http://varianceexplained.org/files/Brauer2008_DataSet1.tds", delim = "\t")
+saveRDS(original_data, file = "data-raw/tidymicro.rds")
+```
+
+```{r}
+original_data <- readRDS("data-raw/tidymicro.rds")
+```
+
+## Reconocer variables
+
+Each of those columns like `G0.05`, `N0.3` and so on represents gene expression values for that sample, as measured by the microarray. The column titles show the condition: __`G0.05`__, for instance, means the __limiting nutrient was glucose__ and the __growth rate was .05__. A higher value means the gene was more expressed in that sample, lower means the gene was less expressed. In total the yeast was grown with __six limiting nutrients__ and __six growth rates__, which makes 36 samples, and therefore 36 columns, of gene expression data.
+
+Diseño experimental:
+
+- 6 nutrientes limitantes
+- 6 tasas de crecimiento
+
+Columnas:
+
+- 36 con tasa de crecimiento por nutriente limitado
+- 4 con identificadores
+
+```{r}
+dim(original_data)
+head(original_data)
+```
+```{r}
+glimpse(original_data)
+```
+
+## Limpieza de datos
+
+__Usando `dplyr` y `tidyr`__
+
+- Una data "limpia" o __"Tidy data"__ o sigue las siguientes reglas:
+    
+    1. Each __variable__ forms a column.
+    2. Each __observation__ forms a row.
+    3. Each type of observational unit forms a table.
+    
+- ¿Qué no está limpio (__"untidy"__) en la data?
+    
+    1. __Column headers are values, not variable names.__ 
+    Our column names contain the values of two variables: nutrient (G, N, P, etc) and growth rate (0.05-0.3). For this reason, we end up with __not one observation per row, but 36!__ This is a very common issue in biological datasets: you often see __one-row-per-gene and one-column-per-sample__, rather than one-row-per-gene-per-sample.
+    
+    2. __Multiple variables are stored in one column.__ 
+    The NAME column contains lots of information, __split up by `||`’s__. 
+    If we examine one of the names, it looks like
+    
+        > SFB2 || ER to Golgi transport || molecular function unknown || YNL049C || 1082129
+    
+        which seems to have both some systematic IDs and some biological information about 
+    the gene. If we’re going to use this programmatically, we need to split up 
+    the information into multiple columns.
+    
+- __"The more effort you put up front into tidying your data, the easier it will be 
+to explore interactively."__
+    + Since the analysis steps are where you’ll actually be answering questions 
+    about your data, it’s worth putting up this effort!
+
+### Múltiples variables están guardadas en una misma columna
+```{r}
+original_data$NAME[1:2]
+```
+
+- The details of each of these fields isn’t annotated in the paper, but we can figure out most of it. It contains:
+    
+    - __Gene name__ e.g. SFB2. Note that not all genes have a name.
+    - __Biological process__ e.g. “proteolysis and peptidolysis”
+    - __Molecular function__ e.g. “metalloendopeptidase activity”
+    - __Systematic ID__ e.g. YNL049C. Unlike a gene name, every gene in this dataset has a systematic ID.
+    - __Another ID number__ e.g. 1082129. I don’t know what this number means, 
+and it’s not annotated in the paper. Oh, well.
+
+- Having all give of these in the same column is very inconvenient. For example, if I have another dataset with information about each gene, I can’t merge the two. Luckily, the `tidyr` package provides the __`separate` function__ for exactly this case.
+
+```{r}
+library(dplyr)
+library(tidyr)
+
+cleaned_data <- original_data %>%
+  separate(NAME, c("name", "BP", "MF", "systematic_name", "number"), sep = "\\|\\|")
+
+head(cleaned_data)
+```
+
+Two more things. First, when we __split by ||__, we ended up with __whitespace at the start and end of some of the columns__, which is inconvenient:
+```{r}
+head(cleaned_data$BP)
+```
+
+We’ll solve that with __dplyr’s `mutate_each`__, along with the built-in `trimws` (“trim whitespace”) function.
+
+```{r}
+cleaned_data <- original_data %>%
+  separate(NAME, c("name", "BP", "MF", "systematic_name", "number"), sep = "\\|\\|") %>%
+  mutate_at(vars(name:systematic_name), funs(trimws))
+
+head(cleaned_data$BP)
+```
+
+Finally, we don’t even know what the number column represents (if you can figure it out, let me know!) And while we’re at it, __we’re not going to use the GID, YORF or GWEIGHT columns__ in this analysis either. We may as well drop them, which we can do with __dplyr’s `select`__.
+
+```{r}
+cleaned_data <- original_data %>%
+  separate(NAME, c("name", "BP", "MF", "systematic_name", "number"), sep = "\\|\\|") %>%
+  mutate_at(vars(name:systematic_name), funs(trimws)) %>%
+  select(-number, -GID, -YORF, -GWEIGHT) 
+
+head(cleaned_data)
+```
+
+### Los titulos de columnas son observaciones, no variables
+
+- Let’s take a closer look at all those __column headers__ like `G0.05`, `N0.2` and `P0.15`.
+    
+    - __Limiting nutrient__. This has six possible values: glucose (G), ammonium (N), sulfate (S), phosphate (P), uracil (U) or leucine (L).
+    - __Growth rate__: A number, ranging from .05 to .3. .05 means slow growth (the yeast were being starved hard of that nutrient) while .3 means fast growth. (Technically, this value measures the dilution rate from the chemostat).
+    - __Expression level__. These are the values currently stored in those columns, as measured by the microarray. (Note that the paper already did some __pre-processing__ and __normalization__ on these values, which we’re ignoring here).
+
+- The rules of tidy data specify that __each variable forms one column__, and this is not even remotely the case- we have 36 columns when we should have 3. That means our data is trapped in our column names. __If you don’t see why this is a problem, consider__: how would you put growth rate on the x-axis of a graph? How would you filter to look only the glucose condition?
+
+- Luckily, the `tidyr` package has a solution ready. The documentation for __`gather`__ notes (emphasis mine):
+    
+    > Gather takes multiple columns and collapses into key-value pairs, 
+    duplicating all other columns as needed. __You use gather() when you notice that you have 
+    columns that are not variables.__
+
+- Hey, that’s us! So let’s apply gather as our next step:
+
+* __OJO:__ Experimentar con el comando `dplyr::count(sample)` luego de aplicar `gather()` para confirmar la __frecuencia__ de datos por observación.
+
+```{r}
+cleaned_data <- original_data %>%
+  separate(NAME, c("name", "BP", "MF", "systematic_name", "number"), sep = "\\|\\|") %>%
+  mutate_at(vars(name:systematic_name), funs(trimws)) %>%
+  select(-number, -GID, -YORF, -GWEIGHT) %>% 
+  gather(sample, expression, G0.05:U0.3)
+
+#cleaned_data
+cleaned_data %>% dplyr::count(sample)
+```
+
+- Notice that the dataset no longer consists of __one-row-per-gene__: it’s __one-row-per-gene-per-sample__. This has previously been called “melting” a dataset, or turning it into “long” format. But I like the term __“gather”__: it shows that we’re taking these 36 columns and pulling them together.
+
+- One last problem. That __sample column really contains two variables, nutrient and rate__. We already learned what to do when we have two variables in one column: use `separate`:
+
+```{r}
+library(dplyr)
+library(tidyr)
+
+cleaned_data <- original_data %>%
+  separate(NAME, c("name", "BP", "MF", "systematic_name", "number"), sep = "\\|\\|") %>%
+  mutate_at(vars(name:systematic_name), funs(trimws)) %>%
+  select(-number, -GID, -YORF, -GWEIGHT) %>%
+  gather(sample, expression, G0.05:U0.3) %>% #dplyr::count(sample)
+  separate(sample, c("nutrient", "rate"), sep = 1, convert = TRUE) 
+
+head(cleaned_data)
+```
+
+- This time, instead of telling separate to split the strings based on a particular delimiter, we told it to __separate it after the first character__ (that is, after G/P/S/N/L/U). We also told it `convert = TRUE` to tell it that it should notice the 0.05/0.1/etc value is a number and convert it.
+
+- __Take a look at those six lines of code, a mini-sonnet of data cleaning__. Doesn’t it read __less like code and more like instructions?__ (“First we separated the NAME column into its five parts, and trimmed each. We selected out columns we didn’t need…”) That’s the beauty of the `%>%` operator and the __dplyr/tidyr verbs__.
+
+## Visualizaciones con ggplot
+
+__¿Por qué limpiar la data?__
+
+- So we went through this effort to get this dataset into this structure, and you’re probably wondering why. In particular, why did we have to bother gathering those expression columns into one-row-per-gene-per-sample?
+
+- Well, suppose we have a single yeast gene we’re interested in. Let’s say LEU1, a gene involved in the leucine synthesis pathway.
+```{r}
+cleaned_data %>%
+  filter(name == "LEU1") %>%
+  glimpse()
+```
+
+We now have __36 data points (six conditions, six growth rates)__, and for each we have a limiting nutrient, a growth rate, and the resulting expresion. We’re probably interested in __how both the growth rate and the limiting nutrient affect the gene’s expression__.
+
+36 points is too many to look at manually. So it’s time to bring in some visualization. To do that, we simply __pipe the results of our filtering right into `ggplot2`__:
+
+```{r}
+cleaned_data %>% 
+  filter(name=="LEU1") %>% 
+  ggplot(aes(rate,expression,colour=nutrient))+
+  geom_line()
+```
+
+- What a story this single gene tells! The gene’s expression is far higher (more “turned on”) when the cell is being starved of leucine than in any other condition, because in that case the cell has to synthesize its own leucine. And as the amount of leucine in the environment (the growth rate) increases, the cell can focus less on leucine production, and the expression of those genes go down. We’ve just gotten one __snapshot of our gene’s regulatory network__, and how it responds to external stimuli.
+
+- We don’t have to choose one gene to visualize- LEU1 is just one gene in the leucine biosynthesis process. Recall that we have that information in the BP column, so we can __filter for all genes in that process, and then facet to create sub-plots for each__.
+```{r}
+cleaned_data %>%
+  filter(BP == "leucine biosynthesis") %>%
+  ggplot(aes(rate, expression, color = nutrient)) +
+  geom_line() +
+  facet_wrap(~name)
+```
+
+- LEU1, LEU2, and LEU4 all show a similar pattern, where starvation of leucine causes higher gene expression. (Interestingly, LEU4 responds to glucose starvation as well. Any geneticists have some idea why?). LEU9 is a little more ambiguous but is still highest expressed under leucine starvation. We already know what these genes do, but this hints at how we might be able to find other genes that are involved in leucine synthesis, including ones we don’t yet know.
+
+- Let’s play with graph a little more. These trends look vaguely linear. Maybe we should show best points with best fit lines instead:
+```{r}
+cleaned_data %>%
+  filter(BP == "leucine biosynthesis") %>%
+  ggplot(aes(rate, expression, color = nutrient)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE) +
+  facet_wrap(~name)
+```
+
+- __The options for exploratory data analysis are endless__. We could instead look at sulfur metabolism:
+
+```{r}
+cleaned_data %>%
+  filter(BP == "sulfur metabolism") %>%
+  ggplot(aes(rate, expression, color = nutrient)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE) +
+  facet_wrap(~name + systematic_name, scales = "free_y")
+```
+
+(Notice that we have to facet by the __systematic_name__ here, since not all genes in this process have traditional names).
+
+- If you were an interested molecular biologist, you could go a long way just by examining various biological processes, or looking at lists of genes you were interested in. This is a great way to explore a dataset interactively, and to hint at methods of further analysis. For example, we notice that we can __fit linear models to many of these expression profiles__ that will come in handy in the next part.
+
+## Conclusión: data específica, herramientas generalizadas
+
+I earlier pointed to a list of available workflows from `Bioconductor`, which teach ways to analyze many kinds of genomic data using packages specialized for those purposes. These kinds of guides are incredibly valuable, and `Bioconductor` has built up an excellent set of tools for analyzing genomic data, many of which come with their own data processing and visualization methods.
+
+__So why bother teaching a dplyr/ggplot2 approach?__ Because these tools are useful _everywhere_. Consider the dozen lines of code we used to clean and visualize our data:
+```{r, eval=FALSE}
+library(dplyr)
+library(tidyr)
+
+cleaned_data <- original_data %>%
+  separate(NAME, c("name", "BP", "MF", "systematic_name", "number"), sep = "\\|\\|") %>%
+  mutate_at(vars(name:systematic_name), funs(trimws)) %>%
+  select(-number, -GID, -YORF, -GWEIGHT) %>%
+  gather(sample, expression, G0.05:U0.3) %>% #dplyr::count(sample)
+  separate(sample, c("nutrient", "rate"), sep = 1, convert = TRUE)
+
+cleaned_data %>%
+  filter(BP == "leucine biosynthesis") %>%
+  ggplot(aes(rate, expression, color = nutrient)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE) +
+  facet_wrap(~name)
+```
+
+With this code we’re able to __go from published data to a new conclusion about leucine biosynthesis__ (or sulfate metabolism, or whatever biological process or genes we’re interested in). But the functions we use aren’t specific to our dataset or data format: in fact, they’re not related to biology at all. __Instead, these tools are building blocks, or “atoms,” in a grammar of data manipulation and visualization that applies to nearly every kind of data__.
+
+This isn’t meant to disparage Bioconductor in any way: scientists should use whatever tool gets their job done. But educators can and should focus on teaching tools that can be universally applied. In turn, students can take these tools and build new packages, for Bioconductor and elsewhere, that analyze novel forms of data.
+
+## Más limpieza
+
+Tres pasos más de limpieza: 
+
+- First, I __spelled out__ the full names of the nutrients- “Glucose” instead of just “G”, for example. 
+- Second, I __filtered out__ missing values from the expression column, as well as genes that have no systematic ID
+- Tercero, __filtrar__ las genes con lecturas completas para tasa de crecimiento por nutriente de cultivo limitado.
+
+### retirar observaciones NA's
+
+__¿Cómo revisar la presencia de NA?__
+
+```{r}
+# tipo de variable: character <chr>
+m <- cleaned_data %>% 
+  filter(systematic_name=="") %>% 
+  dplyr::count()
+# tipo de variable: double <dbl>
+n <- cleaned_data %>% 
+  filter(is.na(expression)) %>% 
+  dplyr::count(expression)
+```
+
+- la variable `systematic_name` posee __`r m$n` NA's__
+- la variable `expression` posee __`r n$n` NA's__
+
+### cambiar el nombre a factores
+
+__Ejecutar la limpieza__
+
+1. __cambiar__ de nombre a los fatores de la variable `nutrient`
+2. __retirar__ a los elementos con: 
+    - `systematic_names `con NA's (porque no habría cómo identificar al gen)
+    - valores de `expression` con NA's
+
+```{r}
+library(forcats)
+cleaned_data <- original_data %>%
+  separate(NAME, c("name", "BP", "MF", "systematic_name", "number"), sep = "\\|\\|") %>%
+  mutate_at(vars(name:systematic_name), funs(trimws)) %>%
+  select(-number, -GID, -YORF, -GWEIGHT) %>%
+  gather(sample, expression, G0.05:U0.3) %>% #dplyr::count(sample)
+  separate(sample, c("nutrient", "rate"), sep = 1, convert = TRUE) %>% 
+  mutate(nutrient=forcats::fct_recode(nutrient, 
+                                      "Glucose" = "G", "Leucine" = "L",
+                                      "Phosphate" = "P", "Sulfate" = "S",
+                                      "Ammonia" = "N", "Uracil" = "U")) %>% 
+  filter(!is.na(expression),systematic_name!="") %>% 
+  glimpse()
+```
+
+### retirar combinaciones con observaciones incompletas
+
+__¿Todos los genes tienen valores de expresión?__
+
+```{r}
+y <- original_data %>%
+  separate(NAME, c("name", "BP", "MF", "systematic_name", "number"), sep = "\\|\\|") %>%
+  mutate_at(vars(name:systematic_name), funs(trimws)) %>%
+  select(-number, -GID, -YORF, -GWEIGHT) %>%
+  gather(sample, expression, G0.05:U0.3) %>% #dplyr::count(sample)
+  separate(sample, c("nutrient", "rate"), sep = 1, convert = TRUE) %>% 
+  mutate(nutrient=forcats::fct_recode(nutrient, 
+                                      "Glucose" = "G", "Leucine" = "L",
+                                      "Phosphate" = "P", "Sulfate" = "S",
+                                      "Ammonia" = "N", "Uracil" = "U")) %>% 
+  filter(!is.na(expression),systematic_name!="") %>% 
+  #filter(systematic_name=="Q0140", nutrient=="Phosphate") # ejemplo con solo dos lecturas de gen x nutriente
+  group_by(systematic_name, nutrient) %>% dplyr::count() %>% 
+  ungroup() %>% count(n) %>% filter(n<6) #%>% summarise(sum(nn))
+```
+
+- Hay __`r sum(y$nn)` genes por nutriente__ con menos de 6 observaciones de la variable `rate` para las combinaciones entre `systematic_name` (gen) y `nutrient` (nutriente limitante).
+
+### final
+
+__Limpieza final__
+
+```{r}
+cleaned_data <- original_data %>%
+  separate(NAME, c("name", "BP", "MF", "systematic_name", "number"), sep = "\\|\\|") %>%
+  mutate_at(vars(name:systematic_name), funs(trimws)) %>%
+  select(-number, -GID, -YORF, -GWEIGHT) %>%
+  gather(sample, expression, G0.05:U0.3) %>% #dplyr::count(sample)
+  separate(sample, c("nutrient", "rate"), sep = 1, convert = TRUE) %>% 
+  mutate(nutrient=forcats::fct_recode(nutrient, 
+                                      "Glucose" = "G", "Leucine" = "L",
+                                      "Phosphate" = "P", "Sulfate" = "S",
+                                      "Ammonia" = "N", "Uracil" = "U")) %>% 
+  filter(!is.na(expression),systematic_name!="") %>% 
+  group_by(systematic_name, nutrient) %>%
+  filter(n()==6) %>% 
+  ungroup() %>% 
+  glimpse()
+```
+
+## Aplicación
+
+Tidying the data in this way lets us make graphs like this
+
+```{r, fig.height=6, fig.width=6}
+cleaned_data %>%
+  filter(BP == "leucine biosynthesis") %>%
+  ggplot(aes(rate, expression, color = nutrient)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE) +
+  facet_wrap(~name + systematic_name)
+```
+
+For starters, let’s wrap this useful graph into a function, so that we can make it easily in the rest of the post.
+
+```{r}
+plot_expression_data <- function(expression_data) {
+  ggplot(expression_data, aes(rate, expression, color = nutrient)) +
+    geom_point() +
+    geom_smooth(method = "lm", se = FALSE) +
+    facet_wrap(~name + systematic_name, scales = "free_y")
+}
+```
+
+At which point we would rewrite the above graph like:
+
+```{r, eval=FALSE}
+cleaned_data %>%
+  filter(BP == "leucine biosynthesis") %>%
+  plot_expression_data()
+```
+
+This is a great way to visualize a few genes at a time. But there are so many genes in the dataset. For example, let’s instead filter by the biological process cell wall organization and biogenesis.
+```{r, fig.height=10, fig.width=10}
+cleaned_data %>%
+  filter(BP == "cell wall organization and biogenesis") %>%
+  plot_expression_data()
+```
+
+OK, that’s 36 genes and it’s already getting a lot harder to understand these plots. And we have 5500 genes in this dataset: no way can we visually interpret all those genes at once. This is where we introduce modeling.
+
+
+
+
+## Computer environment
+```{r}
+devtools::session_info()
+```
+
+## References

@@ -1,0 +1,590 @@
+---
+title: 'Limpieza y visualización de datos: `tidyverse`'
+author: "avallecam"
+date: '`r Sys.Date()`'
+output:
+  html_document:
+  #pdf_document:
+  #html_notebook:
+    toc: yes
+    toc_depth: 4
+    toc_float:
+      collapsed: yes
+    #theme: united
+    #code_folding: "hide"
+    #fig_caption: TRUE
+    #number_sections: TRUE
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+options(width = 90) # expand limits of CONSOLE output
+```
+
+El presente tutorial está basado en la [publicación](http://michaellevy.name/blog/tidyverse-talk/)
+de [Michael Levy](http://michaellevy.name/) y la [publicación](https://rpubs.com/bradleyboehmke/data_wrangling) 
+de [Bradley Boehmke](http://bradleyboehmke.github.io/).
+El material ha sido readaptado para cumplir el objetivo del curso.
+
+Mayor detalle en el [libro](http://r4ds.had.co.nz/tidy-data.html) de Hadley Wickham.
+
+## Objetivo
+
+- Introducir las herramientas y estilo del `tidyverse` para la limpieza de datos.
+
+```{r, echo=FALSE, message=FALSE}
+library(tidyverse)
+library(EDAWR)
+```
+
+## Análisis de datos
+
+Analysts tend to follow __4 fundamental processes__ to turn data into understanding, knowledge & insight:
+
+1. __Data manipulation__
+2. Data visualization
+3. Statistical analysis/modeling
+4. Deployment of results
+
+This tutorial will focus on __data manipulation__
+
+## Data manipulation
+
+> It is often said that __80% of data analysis__ is spent on the process of cleaning and preparing the data. (Dasu and Johnson, 2003)
+
+__Well structured data__ serves two purposes:
+
+- Makes data suitable for software processing whether that be mathematical functions, visualization, etc.
+- Reveals information and insights
+
+![data wrangle](figure/tidy_02.png)
+
+### Tidy data
+
+Put data in data frames  
+
+- Each __variable__ gets a column
+- Each __observation__ gets a row
+- Each __type of observation__ gets a data frame
+
+![tidy data](figure/tidy-1.png)
+
+## What is the tidyverse?
+
+The tidyverse is a __suite of R tools__ that follow a __tidy philosophy__.
+
+### Tidy APIs
+
+__Functions__ should be consistent and __easily (human) readable__
+
+- Take __one step__ at a time
+- __Connect__ simple steps with the `pipe`
+- Referential __transparency__
+
+### Okay but really, what is it? 
+
+Suite of ~20 packages that provide __consistent__, __user-friendly__, __smart-default tools__ to do most of what most people do in R.
+
+- __Core packages__: ggplot2, dplyr, tidyr, readr, purrr, tibble
+- __Specialized data manipulation__: hms, stringr, lubridate, forcats
+- __Data import__: DBI, haven, httr, jsonlite, readxl, rvest, xml2
+- __Modeling__: modelr, broom
+
+__`install.packages(tidyverse)`__ installs all of the above packages.
+
+__`library(tidyverse)`__ attaches only the core packages.
+
+![tidyverse](figure/tidyverse.png)
+
+![tidyverse functions](figure/tidyverse1.png)
+
+## Why tidyverse?
+
+- __Consistency__
+    - e.g. Many functions take data.frame first -> __piping__
+        - Faster to __write__
+        - Easier to __read__
+        - Easier to __remember__
+    - __Tidy data__: Imposes good practices
+- __Simple solutions__ to common problems (e.g. `tidyr::separate`)
+- Runs __fast__ (thanks to `Rcpp`).
+- It is __modular__! (with the UNIX pipe `|` "spirit")
+
+### `tibble`
+
+> A modern reimagining of data frames.
+
+```{r class tbl}
+tdf = tibble(x = 1:1e4, y = rnorm(1e4))  # == data_frame(x = 1:1e4, y = rnorm(1e4))
+class(tdf)
+```
+
+
+Tibbles print politely. 
+
+```{r print tbl}
+tdf
+```
+
+Tibbles have some convenient and consistent defaults that are different from base R data.frames.
+
+### The pipe `%>%`
+
+Sends the output of the LHS function to the first argument of the RHS function.
+
+```{r pipe}
+sum(1:8) %>%
+  sqrt()
+```
+
+> __`%>%` se obtiene de forma automática con el atajo `Ctrl+M`__
+
+- When you desire to perform __multiple functions__ its advantage becomes obvious. 
+
+- For instance, if we want to 
+    - __filter__ some data, 
+    - __summarize it__, and then 
+    - __order__ the summarized results we would write it out as:
+
+__Nested Option:__
+
+    arrange(
+            summarize(
+                filter(data, variable == numeric_value),
+                Total = sum(variable)
+            ),
+        desc(Total)
+    )
+
+
+or
+
+__Multiple Object Option:__
+
+     a <- filter(data, variable == numeric_value)
+     b <- summarise(a, Total = sum(variable))
+     c <- arrange(b, desc(Total))
+
+
+or
+
+__`%>%` Option:__
+
+     data %>%
+            filter(variable == “value”) %>%
+            summarise(Total = sum(variable)) %>%
+            arrange(desc(Total))
+
+
+- As your __function tasks get longer__ the `%>%` operator becomes more efficient and makes your code __more legible__. 
+- In addition, the `%>%` operator __allows you to flow__ from __data manipulation__ tasks straight into __vizualization functions__ (via `ggplot` and ggvis) and also into many __analytic functions__.
+
+### `tidyr`
+
+There are __four__ fundamental functions of __data tidying__:
+
+- `gather()` takes multiple columns, and gathers them into key-value pairs: __it makes “wide” data longer__.
+- `spread()` takes two columns (key & value) and spreads in to multiple columns, __it makes “long” data wider__.
+
+- `separate()` __splits__ a single column into multiple columns
+- `unite()` __combines__ multiple columns into a single column
+
+#### `gather` and `spread`
+
+`gather` to make wide table long, `spread` to make long tables wide.
+
+![tidyr::gather](figure/tidy_03.png)
+
+![gather](figure/tidy-2.png)
+
+![spread](figure/tidy-3.png)
+
+- mini
+
+```{r}
+library(EDAWR)
+cases %>%
+  tbl_df() %>%
+  gather(key= year, value=n, -country) %>%
+  spread(year, n)
+```
+
+```{r, eval=FALSE}
+stocks <- data.frame(
+  time = as.Date('2009-01-01') + 0:9,
+  X = rnorm(10, 0, 1),
+  Y = rnorm(10, 0, 2),
+  Z = rnorm(10, 0, 4)
+)
+stocksm <- stocks %>% gather(stock, price, -time) #%>% count(stock) #use gather()+count()
+stocksm %>% spread(stock, price)
+stocksm %>% spread(time, price)
+```
+
+- large
+
+```{r who}
+who  # Tuberculosis data from the WHO
+```
+
+```{r gather}
+who %>%
+  gather(group, cases, -country, -iso2, -iso3, -year)
+```
+
+#### `separate` and `unite`
+
+![separate](figure/tidy-4.png)
+![unite](figure/tidy-5.png)
+
+- mini
+
+```{r}
+df <- data.frame(x = c(NA, "a.b", "a.d", "b.c"))
+df %>% 
+  tidyr::separate(x, c("A", "B")) %>%
+  tidyr::unite(x, A, B, sep=".")
+```
+
+```{r, eval=FALSE}
+mtcars %>%
+  tbl_df() %>%
+  select(7:9) %>% 
+  tidyr::unite(vs_am, vs, am) %>%
+  tidyr::separate(vs_am, c("vs", "am"))
+```
+
+- large
+
+```{r}
+library(EDAWR)
+storms %>%
+  top_n(2,date) %>%
+  separate(date, c("y", "m", "d")) %>%
+  unite(date, y,m,d, sep="-")
+```
+
+```{r}
+# extra
+library(EDAWR)
+pollution %>%
+  tbl_df() %>%
+  spread(size, amount) %>%
+  gather(size, amount, -city) %>%
+  arrange(desc(city))
+```
+
+
+### `dplyr`
+
+_Common data(frame) manipulation tasks._
+
+There are __seven__ fundamental functions of __data transformation__:
+
+- `select()` select variables
+- `mutate()` create new variables
+- `filter()` filter observations
+- `arrange()` reorder observations
+- `group_by()` groups observations by categorical levels
+- `summarise()` summarise observations by functions of choice <!--group_by+summarize-->
+- `join()` joins separate dataframes
+
+#### `select`
+
+- __select__ variables
+
+```{r}
+iris %>%
+  tbl_df() %>%
+  select(Petal.Length, Petal.Width)
+```
+
+```{r, eval=FALSE}
+# equivalent
+iris %>%
+  tbl_df() %>%
+  select(3,4)
+
+iris %>%
+  tbl_df() %>%
+  select(-Species)
+
+iris %>%
+  tbl_df() %>%
+  select_if(is.factor)
+```
+
+__use select_helpers!!!__
+
+```{r, eval=FALSE}
+# ?select_helpers
+iris %>%
+  tbl_df() %>%
+  select(starts_with("Petal"))
+iris %>%
+  tbl_df() %>%
+  select(ends_with("Width"))
+iris %>%
+  tbl_df() %>%
+  select(contains("etal"))
+iris %>%
+  tbl_df() %>%
+  select(-matches(".t.")) # accepts 'NOT' condition
+```
+
+#### `mutate`
+
+- __create__ new variables
+
+```{r}
+mtcars %>%
+  tbl_df() %>%
+  select(1:3) %>% 
+  mutate(gpm= 1/mpg)
+```
+
+```{r}
+iris %>%
+  tbl_df() %>%
+  mutate_at(vars(-Species), funs(log))# %>% # vars() funs()
+```
+
+
+#### `filter`
+
+- __filter__ observations
+- try to use always the form __`dplyr::filter`__
+
+```{r}
+iris %>%
+  tbl_df() %>%
+  # logical criteria
+  dplyr::filter(Sepal.Length > 7)
+```
+
+#### `arrange`
+
+- __reorder__ observations
+
+```{r}
+mtcars %>%
+  tbl_df() %>%
+  select(1:3) %>% 
+  # order rows
+  dplyr::arrange(mpg) %>%
+  dplyr::arrange(desc(mpg))
+```
+
+#### `group_by` + `summarise`
+
+- `group_by()` __groups__ observations by categorical levels
+- `summarise()` __summarise__ observations by functions of choice <!-- group_by + summarize -->
+
+```{r}
+iris %>%
+  tbl_df() %>%
+  # compute separate summary row for each group
+  dplyr::group_by(Species) %>%
+  summarise(avg= mean(Sepal.Length)) %>%
+  dplyr::ungroup()
+```
+
+
+#### `joins`
+
+- `dplyr` also does __multi-table joins__ and can __connect__ to various types of databases.
+
+```{r full join}
+t1 = data_frame(alpha = letters[1:6], num = 1:6)
+t2 = data_frame(alpha = letters[4:10], num = 4:10)
+full_join(t1, t2, by = "alpha", suffix = c("_t1", "_t2"))
+```
+
+__Super-secret pro-tip__: You can `group_by` %>% `mutate` to accomplish a summarize + join
+
+```{r group mutate, eval=FALSE}
+data_frame(group = sample(letters[1:3], 10, replace = TRUE),
+           value = rnorm(10)) %>%
+  group_by(group) %>%
+  mutate(group_average = mean(value))
+```
+
+### `ggplot2`
+
+__Visualization package__
+
+- Note that __the pipe__ and __consistent API__ make it __easy to combine functions__ from different packages, and the whole thing is quite readable.
+
+```{r, fig.height=5, fig.width=10}
+# density, cumsum, cume_dist + facet
+z <- iris %>%
+  tbl_df() %>%
+  gather(key=attrib, value= attrib_m, -Species) %>%
+  group_by(attrib, Species) %>%
+  arrange(attrib, Species, attrib_m) %>%
+  dplyr::mutate_if(is.numeric,funs(cumsum, cume_dist))
+#dplyr::mutate_each(funs(cumsum, cume_dist), -Species)
+
+b <- z %>%
+  ggplot(aes(attrib_m,cumsum)) + 
+  geom_line(aes(colour= Species)) +
+  facet_grid(. ~ attrib)
+
+c <- iris %>%
+  gather(key=attrib, value= attrib_m, -Species) %>%
+  ggplot(aes(attrib_m)) + 
+  geom_density(aes(colour= Species)) + 
+  facet_grid(. ~ attrib)
+
+Rmisc::multiplot(b, c, cols = 1)  
+```
+
+
+```{r dplyr-tidyr-ggplot}
+who %>%
+  select(-iso2, -iso3) %>%
+  gather(group, cases, -country, -year) %>%
+  count(country, year, wt = cases) %>%
+  ggplot(aes(x = year, y = n, group = country)) +
+  geom_line(size = .2) 
+```
+
+## ANEXO: Rstudio
+
+__¡Sácale el jugo a sus ventajas!__
+
+- Atajos:
+    - __Ctrl+__ Shift+K: __knitr__
+    - __Alt+__ Shift+K: __show all key shortcuts__
+
+- Atajos con Ctrl+
+    1. __script__
+    2. __console__
+    3. help
+    4. ~~history search~~
+    5. __files__
+    6. __plots__
+    7. __packages__
+    8. ~~environment~~
+    9. ~~Viewer~~
+
+- Recuerda el __pipe `%>%`__
+    * __Ctrl+M__
+
+## stats with `broom`
+
+```{r, eval=FALSE}
+# 1. summary stats
+iris %>% 
+  tbl_df() %>% 
+  gather(key=attrib, value= attrib_m, -Species) %>%
+  group_by(Species, attrib) %>%
+  summarise_if(is.numeric,c("mean", "median", #location
+                            "IQR", "mad", "sd", "var")) %>% #spread
+  filter(attrib=="Sepal.Length")
+  #glimpse()
+
+# 2. distribution visualization
+iris %>%
+  ggplot(aes(Sepal.Length)) + 
+  geom_density(aes(colour= Species))
+
+# 2. test hypothesis
+iris %>%
+  filter(Species!="setosa") %>%
+  t.test(Sepal.Length ~ Species, data=.) %>%
+  broom::tidy()
+
+iris %>%
+  filter(Species!="versicolor") %>%
+  t.test(Sepal.Length ~ Species, data=.) %>%
+  broom::tidy()
+
+iris %>%
+  filter(Species!="virginica") %>%
+  t.test(Sepal.Length ~ Species, data=.) %>%
+  broom::tidy()
+
+iris %>%
+  #filter(Species!="setosa") %>%
+  aov(Sepal.Length ~ Species, data=.) %>%
+  broom::tidy()
+  broom::glance()
+  broom::augment()
+```
+
+
+## MÁS EJEMPLOS
+
+```{r, eval=FALSE}
+library(tidyverse)
+library(stringr)
+library(forcats)
+library(broom)
+#library(EDAWR)
+
+#
+tidyr::who %>%
+  filter(iso3=="PER") %>% 
+  summarise_if(is.numeric,mean, na.rm=T) %>%
+  glimpse()
+
+# one -------------------------------------
+who1 <- tidyr::who %>%
+  gather(new_sp_m014:newrel_f65,
+         key= "key",
+         value= "cases",
+         na.rm=T) %>%
+  mutate(key= stringr::str_replace(key, 
+                                   "newrel","new_rel")) %>% 
+  separate(key, 
+           c("new", "type", "sexage"), 
+           sep="_") %>% 
+  select(-new, -iso2, -iso3) %>% 
+  separate(sexage, 
+           c("sex", "age"), 
+           sep=1) 
+
+who1 %>%
+  filter(country=="Peru") %>% 
+  mutate(age= forcats::fct_reorder(age, desc(cases))) %>% 
+  ggplot(aes(year, cases)) + 
+  geom_line(aes(colour=age))
+  #count(age)
+  #View()
+
+# two -------------------------------------
+who2 <- who1 %>%
+  group_by(country, year, sex) %>% 
+  summarise_at(vars(cases), sum, na.rm=T) 
+
+who2 %>%
+  filter(country=="Peru") %>%
+  ggplot(aes(year, cases)) + 
+  geom_line(aes(colour=sex)) +
+  facet_wrap(~ country)
+
+# three -------------------------------------
+who3 <- who2 %>% 
+  group_by(country) %>% 
+  summarise_at(vars(cases), sum, na.rm=T) %>% 
+  top_n(20, wt=cases) %>% 
+  select(country) %>% 
+  inner_join(who1) %>% 
+  bind_rows(who1 %>%
+              filter(country=="Peru")) 
+
+who3 %>% 
+  group_by(country) %>% 
+  mutate(age= forcats::fct_reorder(age, desc(cases))) %>%
+  ggplot(aes(year, log10(cases))) + 
+  geom_line(aes(colour=age)) +
+  facet_wrap(~ country)
+```
+
+## Computer environment
+```{r}
+devtools::session_info()
+```
+
+## References

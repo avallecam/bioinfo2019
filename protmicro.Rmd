@@ -1,0 +1,1219 @@
+---
+title: "Microarreglos de Proteínas: Uso de `tidyverse` y `Bioconductor`"
+author: "avallecam@gmail.com"
+date: "2017-08-04"
+output:
+  #html_document:
+  #pdf_document:
+  html_notebook:
+    toc: yes
+    toc_depth: 5
+    toc_float:
+      collapsed: yes
+    #theme: united
+    #code_folding: "hide"
+    #fig_caption: TRUE
+    #number_sections: TRUE
+bibliography: malaria.bib
+link-citations: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+options(width = 90) # expand limits of CONSOLE output
+```
+
+Aquí se presenta la (i) limpieza de datos reportados, (ii) creación de un ExpressionSet y (iii) reproducción de resultados del 
+artículo publicado por [Torres et al. 2015](https://academic.oup.com/jid/article-lookup/doi/10.1093/infdis/jiu614), en el cual aplican la tecnología del microarreglo de proteínas.
+
+## Objetivo
+
+- Complementar el flujo de trabajo de `Bioconductor` para el análisis de microarreglos.
+
+__Nota:__ Todos los outputs deben verse como líneas corridas. _Disminuir el zoom de ser necesario._
+
+## Dependencies
+```{r, message=FALSE,warning=FALSE}
+library(tidyverse)
+#library(ggrepel)
+library(Biobase)
+library(limma)
+library(NMF)
+```
+
+## Data input
+
+La data ha sido adquirida por:
+
+- Importación del archivo __excel__ disponible en el material suplementario del artículo referido.
+
+```{r, eval=FALSE, echo=TRUE}
+#https://academic.oup.com/jid/article-lookup/doi/10.1093/infdis/jiu614#supplementary-data
+protmicro <- readxl::read_excel("data-raw/jiu614_Supplementary_Data/jiu614supp_table1.xlsx")
+```
+
+Ambas bases han sido grabadas en un formato `.rds` con la función `saveRDS()` para facilitar su distribución y acceso.
+```{r,eval=FALSE, echo=TRUE}
+saveRDS(protmicro, "data-raw/protmicro.rds")
+```
+
+Por ello, la importación de ambas bases será ejecutada por la función `readRDS()`.
+```{r}
+protmicro <- readRDS("data-raw/protmicro.rds")
+```
+
+## Protein microarray: Malaria
+
+__Contexto:__
+
+- Pacientes __con__ parasitemia circulante de _P. falciparum_ y __auscencia__ de síntomas son considerados como individuos con inmunidad clínica ante la malaria.
+- __Hipótesis:__ La respuesta de anticuerpos ante la infección en el grupo de __pacientes asintomáticos__ reconoce un subgrupo de proteínas de _P. falciparum_, posiblemente asociadas al desarrollo de la inmunidad clínica.
+
+Revisar más información sobre el experimento [aquí](https://academic.oup.com/jid/article-lookup/doi/10.1093/infdis/jiu614).
+
+### Problema
+
+- ¿Cómo limpiar la data dsponible y generar un `ExpressionSet()` desde cero?
+- ¿Qué proteínas están diferencialmente reconocidas en el grupo de asintomáticos con respecto a los sintomáticos?
+
+### Tidy up data
+
+```{r}
+raw<-protmicro
+```
+
+```{r, eval=FALSE}
+raw %>% View()
+```
+
+#### phenotype data
+
+- Objetivo:
+    + Extraer la data fenotípica,
+    + Transponer su estructura,
+    + Asignar el nombre de muestra por columna,
+    + Crear un nuevo objeto capaz de ser leído por el `ExpressionSet`.
+
+```{r}
+#samples <- raw[1:2,] %>% colnames()
+#samples %>% as.matrix() %>% t() %>% class()
+#https://stackoverflow.com/questions/34004008/transposing-in-dplyr
+
+pheno_data <- raw[1:2,] %>% 
+  slice(1) %>% 
+  select(-1,-2) %>% 
+  mutate(group=1) %>% 
+  gather(sample_name,phenotype) %>% #count(phenotype)
+  filter(phenotype!="1") 
+
+pheno_data %>% arrange(sample_name)
+pheno_data %>% count(phenotype)
+```
+
+```{r}
+#https://www.rdocumentation.org/packages/tibble/versions/1.3.3/topics/rownames
+pheno_data_row <- pheno_data %>% 
+  arrange(sample_name) %>% 
+  as.data.frame() %>% 
+  column_to_rownames(var="sample_name")
+
+pheno_d <- new("AnnotatedDataFrame", data=pheno_data_row)
+```
+
+#### expression data
+
+- Objetivo:
+    + Transformar el `data.frame` a una matriz,
+    + Separar la data de expresión de la data de normalización.
+
+```{r, echo=FALSE, eval=FALSE}
+#raw %>% View()
+raw[77:nrow(raw),] %>% 
+  rename(gene_name="X__1",
+         gene_ID="X__2") %>% 
+  select(1:10,-gene_name) %>% #solo primeras 8 muestras con fin demostrativo
+  mutate(group=seq(n())) %>% #crear un id por fila -> unirlo con los id de genes
+  unite(gene_ID.n,gene_ID,group,sep = ".") %>% 
+  gather(sample_name, expression, -gene_ID.n) %>% 
+  mutate(expression=as.numeric(expression)) %>% 
+  reshape2::acast(gene_ID.n ~ sample_name,
+                  value.var = "expression") %>% head() #%>% class()
+```
+
+```{r}
+# limpieza inicial
+exprs_data <- raw[77:nrow(raw),] %>% 
+  rename(gene_name="X__1",
+         gene_ID="X__2") %>% 
+  select(-gene_name) %>% 
+  mutate(group=seq(n())) %>% 
+  unite(gene_ID.n,gene_ID,group,sep = ".") %>% 
+  mutate(gene_ID.n=stringr::str_replace(gene_ID.n,"\\s",""))
+
+#exprs_data %>% dim() #33668
+exprs_ctrl <- exprs_data %>% slice(1:31) #%>% dim() # 31 "no DNA" per sample
+exprs_prot <- exprs_data %>% slice(32:n()) #%>% dim() # 33637 "no DNA" per sample
+
+# PROTEINS
+exprs_prot_m <- exprs_prot %>% 
+  gather(sample_name, expression, -gene_ID.n) %>% 
+  mutate(expression=as.numeric(expression)) %>% 
+  reshape2::acast(gene_ID.n ~ sample_name,
+                  value.var = "expression") #%>% class()
+# dimensión
+dim(exprs_prot_m)
+# seis lecturas por proteína de las 8 primeras muestras
+head(exprs_prot_m[,1:8])
+
+# CONTROL
+exprs_ctrl_m <- exprs_ctrl %>%
+  summarise_all(median) %>% # MEDIAN to NORMALIZE against noDNA controls
+  gather(sample_name, expression, -gene_ID.n) %>% 
+  mutate(expression=as.numeric(expression)) %>% 
+  reshape2::acast(gene_ID.n ~ sample_name,
+                  value.var = "expression") #%>% dim() #%>% class()
+# dimensión
+dim(exprs_ctrl_m)
+# controles noDNA de las 8 primeras muestras
+exprs_ctrl_m[,1:8]
+```
+
+```{r}
+mat <- NULL # crear objeto vacío
+# loop para generar una matriz de las dimensiones de `exprs_prot_m`
+for(i in 1:nrow(exprs_prot_m)){
+  mat <- rbind(mat,exprs_ctrl_m)
+}
+# dimensiones de la matriz con la mediana de ctrls `noDNA` creada
+dim(mat)
+# matriz con la mediana de ctrls `noDNA` para las 8 primeras muestras
+head(mat[,1:8]) #%>% class()
+```
+
+#### gene names
+
+```{r}
+# generate a list (df) of gene names and gene ID's
+ln <- raw[108:nrow(raw),1:2] %>% 
+  rename(gene_name="X__1",
+         gene_ID="X__2") %>% 
+  mutate(num=seq(from=32, to=31+n())) %>% 
+  unite(gene_ID.n,gene_ID,num,sep=".") %>%
+  full_join(exprs_prot,by="gene_ID.n") %>% 
+  select(1:2) %>% 
+  rename(Gene.ID=gene_ID.n)
+```
+
+### Normalization + Transformation
+
+Objetivo de la __normalización__: homogeneizar la variabilidad entre arreglos
+en base a controles, los cuales se asume que son invariantes entre muestras. 
+El método depende del diseño de arreglos:
+
+- sustracción de controles o _fold over control_ (__FOC__),
+aplicado en microarreglos de proteínas con respecto a la mediana del control blanco
+por muestra [@King2015FOC];
+- estabilización de varianzas o __VSN__, 
+aplicado en microarreglos de DNA con respecto a controles de 
+intensidad invariante entre muestras, e.g. genes _housekeeping_ [@huber2002vsn]
+
+Objetivo de la __transformación__: reducir la
+heterocedasticidad o heterogeneidad de varianzas entre las observaciones 
+por errores aleatorios en el proceso de hibridación [@kreil2005bullet].
+Dos principales métodos:
+
+- __logarítmica__,
+la cual asume un error multiplicativo que corrige las varianzas de 
+alta intensidad pero capaz dispersar a las de baja intensidad; y
+- __asinh__,
+la cual asume un error multiplicativo y aditivo que corrige esta dispersión, 
+pero solo relevante en contextos donde los valores normalizados menores a la unidad 
+tienen significado biológico.
+
+En el contexto de microarreglos de DNA, ambas transformaciones permiten homogenizar la sobreexpresión o represión génica con respecto a el control elegido. Por ejemplo, una sobreexpresión de 4 sobre el control se homogeniza con una represión de la misma magnitud:
+
+$$log_2\left(\frac{gen_x}{ctrl}\right) \qquad \Rightarrow \qquad log_2\left(\frac{4a}{a}\right)=+2 \qquad or \qquad log_2\left(\frac{b}{4b}\right)=-2$$
+
+> **NOTA**: Los autores del paper reportan el método `vsn`. A diferencia de la transformación logarítimica, este logra corregir errores en lecturas de intensidad baja (e.g., cercanas y menores a la unidad posterior a su normalización). Es idóneo en experimentos donde la intensidades positivas y negativas con respecto al control (generalmente, genes _housekeeping_) son biológicamente relevantes. Sin embargo, el contexto de microarreglo de proteínas es particularmente asimétrico, es decir, las lecturas con relevancia biológica serán todas las que poseean intensidades mayores al control negativo (noDNA) usado en la normalización. 
+Más detalles, [aquí](https://academic.oup.com/bib/article/6/1/86/288923/Tutorial-section-There-is-no-silver-bullet-a-guide)
+
+```{r}
+# custom function
+# definir resultado para los valores menores a cero, 
+# donde el log no está definido
+log2.NA = function(x) {log2(ifelse(x>0, x, NA))}
+
+# normalización con respecto a los controles `noDNA` c/ transformación log2
+exprs_norm <- log2.NA(exprs_prot_m/mat)
+head(exprs_norm[,1:6])
+```
+
+```{r, fig.height=4, fig.width=10, eval=FALSE, echo=FALSE}
+# compare between normalization methods
+z <- exprs_prot_m %>% 
+  as.data.frame() %>% as.tbl() %>% 
+  gather(sample,expression) %>% 
+  arrange(expression) #%>% summary()
+a <- exprs_prot_m/mat
+#a %>% dim()
+b <- a %>% 
+  as.data.frame() %>% as.tbl() %>% 
+  gather(sample,expression) %>% 
+  arrange(expression) #%>% summary()
+c <- b %>% 
+  ggplot(aes(expression,log2(expression))) +
+  geom_hex() +
+  #geom_density2d()+
+  geom_vline(aes(xintercept=1), lty=3)
+d <- b %>% 
+  ggplot(aes(expression,log2(expression))) +
+  #geom_hex() +
+  geom_density2d()+
+  geom_vline(aes(xintercept=1), lty=3)
+Rmisc::multiplot(c,d,cols = 2)
+
+e <- b %>% group_by(sample) %>% 
+  summarise(mean=mean(expression),sd=sd(expression)) %>% 
+  ggplot(aes(mean,sd))+
+  geom_point()+geom_smooth()
+f <- b %>% 
+  mutate_at(vars(expression), funs(log2)) %>% #arrange(sample)
+  group_by(sample) %>%
+  summarise(mean=mean(expression),sd=sd(expression)) %>% 
+  ggplot(aes(mean,sd))+
+  geom_point()+geom_smooth()
+Rmisc::multiplot(e,f,cols = 2)
+```
+
+
+<!--
+
+__En el pasado...__
+
+```r
+all.raw_rnames <- raw[,2]
+all.raw_data <- data.matrix(raw[,3:ncol(raw)])
+rownames(all.raw_data) <- all.raw_rnames
+ctrl.raw_rnames <- raw[1:31,2]
+ctrl.raw_data <- data.matrix(raw[1:31,3:ncol(raw)])
+rownames(ctrl.raw_data) <- ctrl.raw_rnames                
+median.ctrl.raw_data<-t(as.matrix(apply(ctrl.raw_data, 2, median)))
+rownames(median.ctrl.raw_data) <- c("median.ctrl")                
+anti.raw_rnames <- raw[32:nrow(raw),2]                           
+anti.raw_data <- data.matrix(raw[32:nrow(raw),3:ncol(raw)])     
+rownames(anti.raw_data) <- anti.raw_rnames                
+median.ctrl.raw_data.1<-rep(median.ctrl.raw_data[1],nrow(anti.raw_data))
+median.ctrl.raw_data.mat<-matrix(median.ctrl.raw_data.1,length(median.ctrl.raw_data.1),1)
+for (i in 2:ncol(median.ctrl.raw_data)) {
+  median.ctrl.raw_data.mat<-cbind(median.ctrl.raw_data.mat,rep(median.ctrl.raw_data[i],nrow(anti.raw_data)))
+}
+log2.zero = function(x) {log2(ifelse(x>0, x, 1))}
+log2.NA = function(x) {log2(ifelse(x>0, x, NA))}   dsitribution
+log2.NA.norm.ANTIGENS<-log2.NA(anti.raw_data/median.ctrl.raw_data.mat)
+```
+-->
+
+
+### Create an ExpressionSet
+
+```{r}
+eset <- ExpressionSet(assayData = exprs_norm, 
+                      phenoData = pheno_d)
+eset
+```
+
+```{r qualityX, echo=FALSE, eval=FALSE}
+### Pre-plots
+
+#### Heatmap
+
+########################### SAMPLE ORDER per group
+
+# [START FROM THE BEGINNNING]
+#eset
+#eset$Group <- factor(eset$Group)
+#eset$Group
+
+#pData(eset) <- cbind(pData(eset),cat_2,t(col.mean.m_dataX))#ncol(pData(eset))
+#rownames(sampleSEVcovariates)
+#cat_2 <- data.frame(as.factor(matrix(sampleSEVcovariates$edad_CAT)))
+#rownames(cat_2) <- rownames(sampleSEVcovariates)
+#colnames(cat_2) <- "edad_CAT_2"
+#pData(eset)[23] <- sampleSEVcovariates$edad_CAT
+#pData(eset) <- cbind(pData(eset),cat_2)#ncol(pData(eset))
+
+# starts
+#class(exprs(eset)) #matrix
+m_data <- exprs(eset)
+m_data<-as.data.frame(m_data)
+
+# [MODIFICATION 28jul2016]
+col.mean.m_dataX<-t(as.matrix(apply(m_data, 2, mean, na.rm=TRUE)))
+rownames(col.mean.m_dataX) <- c("col.mean.m")                 # assign row names 
+#col.mean.m_dataX
+
+row.mean.m_data<-as.matrix(apply(m_data, 1, mean, na.rm=TRUE))
+colnames(row.mean.m_data) <- c("row.mean.m")                 # assign row names 
+#row.mean.m_data
+
+
+m_data_row.mean<-cbind(m_data,row.mean.m_data)
+m_data_row.mean<-as.matrix(m_data_row.mean)
+
+m_data_row.mean<-as.data.frame(m_data_row.mean)
+m_data_row.mean<-m_data_row.mean[order(-m_data_row.mean$row.mean.m),]
+m_data_row.mean<-as.matrix(m_data_row.mean)
+
+m_data_row.mean<-as.data.frame(m_data_row.mean)
+m_data_row.mean$row.mean.m<-NULL
+#dim(m_data_row.mean)
+#m_data_row.mean
+m_data_row.mean<-as.matrix(m_data_row.mean)
+#
+
+m_data_col.row.mean<-rbind(m_data_row.mean,col.mean.m_dataX)
+
+m_data_col.row.mean<-t(m_data_col.row.mean)
+m_data_col.row.mean<-as.data.frame(m_data_col.row.mean)
+
+m_data_col.row.mean<-m_data_col.row.mean[order(m_data_col.row.mean$col.mean.m),]
+m_data_col.row.mean$col.mean.m<-NULL
+m_data_col.row.mean<-t(m_data_col.row.mean)
+
+m_data_col.row.mean<-as.data.frame(m_data_col.row.mean)
+#dim(m_data_col.row.mean)
+#m_data_col.row.mean
+m_data_col.row.mean<-as.matrix(m_data_col.row.mean)
+# ends
+
+
+##### TOP10 OF HIGHER REACTIVITY in BOTH GROUPS -> the same as sort.by AveExp
+#head(rownames(m_data_col.row.mean), 10)
+
+# [ADDED 28jul2016]
+feature_sort_mean<-rownames(m_data_col.row.mean)
+sample_sort_mean_FIRST<-colnames(m_data_col.row.mean)
+#
+pData(eset) <- cbind(pData(eset),t(col.mean.m_dataX))#ncol(pData(eset))
+#
+eset <- eset[feature_sort_mean,sample_sort_mean_FIRST] ## REORDER samples and features inside the ExpressionSet
+
+#eset$Group
+```
+
+```{r heatmap11, eval=FALSE, echo=FALSE}
+#head(anti.raw_data)[,1:5]
+#head(log2.NA.norm.ANTIGENS)[,1:5]
+#head(exprs(normal.log2.raw.eSet.VIVAX.SEV.FILTER))[,1:5]
+#anti.raw_data
+rawhm <- exprs_prot_m[feature_sort_mean,sample_sort_mean_FIRST] ## REORDER samples and features inside the ExpressionSet
+#head(rawhm)[,1:5]
+
+#log2hp <- exprs(normal.log2.raw.eSet.VIVAX.SEV.FILTER)[feature_sort_mean,sample_sort_mean_FIRST] ## REORDER samples and features inside the ExpressionSet
+#sum(log2hp==exprs(eset))
+#head(log2hp)[,1:5]
+#head(exprs(eset))[,1:5]
+#ctrl.raw_data
+ctrlhm <- exprs_ctrl_m[,sample_sort_mean_FIRST] ## REORDER samples and features inside the ExpressionSet
+#head(ctrlhm)[,1:5]
+
+#head(median.ctrl.raw_data)[,1:5]
+#median.ctrl.raw_data
+```
+
+```{r heatmap0, eval=FALSE, fig.height=8, fig.width=8, fig.align="center", echo=FALSE}
+
+#__Sort all by Mean Sample Intensity__
+
+#eset<-normal.log2.raw.eSet.VIVAX.SEV.FILTER
+#pData(eset) <- pData(eset)[,9:ncol(pData(eset))]
+#library(NMF)
+aheatmap(exprs(eset), Rowv = NA, Colv = NA, annCol = pData(eset))
+```
+
+```{r bckgrd1, fig.height=8, fig.width=8, fig.align='center', warning=FALSE, message=FALSE, echo=FALSE, eval=FALSE}
+#### Backgroud effect
+#rownames(row.mean.m_data)
+RAW_data <- exprs_prot_m[rownames(row.mean.m_data),]
+row.mean.RAW_data<-as.matrix(apply(RAW_data, 1, median, na.rm=TRUE))
+colnames(row.mean.RAW_data) <- c("row.mean.RAW")                 # assign row names 
+#
+col.mean.RAW_data<-as.matrix(apply(RAW_data[,colnames(col.mean.m_dataX)], 2, median, na.rm=TRUE)) ### ONLY FOR 60 samples
+colnames(col.mean.RAW_data) <- c("col.mean.RAW")                 # assign row names 
+#
+#head(row.mean.RAW_data)
+#head(row.mean.m_data)
+totint <- cbind(row.mean.m_data,row.mean.RAW_data)
+totint <- as.data.frame(totint)
+colnames(totint) <- c("LOG2.feature.mean.int", "RAW.feature.median.int")
+t1 <- ggplot(totint, aes(x=LOG2.feature.mean.int,y=RAW.feature.median.int)) + geom_point() + geom_smooth()
+#
+sampleint <- cbind(t(col.mean.m_dataX),col.mean.RAW_data)
+sampleint <- as.data.frame(sampleint)
+colnames(sampleint) <- c("LOG2.sample.mean.int", "RAW.sample.median.int")
+t2 <- ggplot(sampleint, aes(x=LOG2.sample.mean.int,y=RAW.sample.median.int)) + geom_point() + geom_smooth()
+#
+#class(col.mean.m_dataX)
+#class(median.ctrl.raw_data) #exprs_ctrl_m
+No.DNA.int <- subset(exprs_ctrl_m, select= colnames(col.mean.m_dataX))
+#No.DNA.int
+#col.mean.m_dataX
+back <- rbind(col.mean.m_dataX,No.DNA.int)
+back <- as.data.frame(t(back))
+colnames(back) <- c("LOG2.sample.mean.int", "RAW.No.DNA.median.int")
+b1 <- ggplot(back, aes(x=LOG2.sample.mean.int,y=RAW.No.DNA.median.int)) + geom_point() + geom_smooth()
+#
+rawk <- cbind(col.mean.RAW_data,t(No.DNA.int))
+rawk <- as.data.frame(rawk)
+colnames(rawk) <- c("RAW.sample.median.int", "RAW.No.DNA.median.int")
+b2 <- ggplot(rawk, aes(x=RAW.sample.median.int,y=RAW.No.DNA.median.int)) + geom_point() + geom_smooth()
+#
+#Rmisc::multiplot(t1,b2,t2,b1, cols=2)
+#
+```
+
+```{r bckgrnd2, fig.width=14, fig.height=7, fig.align='center', echo=FALSE, eval=FALSE}
+
+# RAW vs LOG2 HEATMAP
+
+par(mfrow=c(1,2))
+
+# [START FROM THE BEGINNNING]
+#eset#<-normal.log2.raw.eSet
+#
+eset <- eset[feature_sort_mean,sample_sort_mean_FIRST] ## REORDER samples and features inside the ExpressionSet
+
+aheatmap(exprs(eset), Rowv = NA, Colv = NA, main = "LOG2")
+aheatmap(rbind(rawhm,ctrlhm), Rowv = NA, Colv = NA, main = "RAW")
+```
+
+```{r homosk1, fig.height=4, fig.width=8, fig.align='center', warning=FALSE, message=FALSE, echo=FALSE, eval=FALSE}
+
+#### Heteroskedasticity 
+#*pre- & post- transformation/normalization*
+
+#
+RAW_data <- exprs_prot_m[rownames(row.mean.m_data),]
+row.sd.RAW_data<-as.matrix(apply(RAW_data, 1, sd, na.rm=TRUE))
+colnames(row.sd.RAW_data) <- c("row.mean.RAW")                 # assign row names 
+#
+homoskRAW <- cbind(row.mean.RAW_data,row.sd.RAW_data)
+homoskRAW <- as.data.frame(homoskRAW)
+colnames(homoskRAW) <- c("RAW.feature.median.int","RAW.feature.sd.int")
+h2 <- ggplot(homoskRAW, aes(x=RAW.feature.median.int,y=RAW.feature.sd.int)) + geom_point() + geom_smooth()
+#
+row.sd.m_data<-as.matrix(apply(m_data, 1, sd, na.rm=TRUE))
+colnames(row.sd.m_data) <- c("row.sd.m")                 # assign row names 
+#
+homosk <- cbind(row.mean.m_data,row.sd.m_data)
+homosk <- as.data.frame(homosk)
+colnames(homosk) <- c("LOG2.feature.mean.int", "LOG2.feature.sd.int")
+h1 <- ggplot(homosk, aes(x=LOG2.feature.mean.int,y=LOG2.feature.sd.int)) + geom_point() + geom_smooth()#method="lm",se=FALSE
+#
+Rmisc::multiplot(h2,h1,cols=2)
+```
+
+### Differential expression
+
+#### Define the control group
+
+- El problem defin al grupo de sintomáticos como el grupo control.
+
+```{r}
+eset$phenotype <- factor(eset$phenotype)
+
+table(eset$phenotype) # debe ser: control (fct referencia) vs caso
+eset$phenotype <- relevel(eset$phenotype, ref = "Symptomatic")
+table(eset$phenotype) # debe ser: control (fct referencia) vs caso
+```
+
+#### Matrix + Linear model + eBayes
+
+```{r}
+design <- model.matrix(~ eset$phenotype)
+fit <- lmFit(eset, design)
+eb <- eBayes(fit)
+topTable(eb) %>% rownames_to_column()
+```
+
+```{r}
+# tidy toptable
+td <- topTable(eb, coef = 2,               # default: slope
+         sort.by =NULL, resort.by =NULL, 
+         #genelist = NULL,                 # no fit$gene
+         number = Inf,                     # show all the hipothesis
+         confint=0.95) %>% rownames_to_column() %>% as.tbl() %>% 
+  dplyr::rename(Gene.ID=rowname)
+```
+
+### Problemas específicos
+
+- Decisión estadística cambia:
+    + microarreglos de DNA -> variación w.r.t. _housekeeping_ gene
+    + microarreglo de proteínas -> veces sobre control (blanco) -> intensidad final es relevante
+
+### Plots
+
+```{r, echo=FALSE, eval=FALSE, echo=FALSE}
+
+#### variance shrinkage
+
+par(mfrow=c(1,2))
+plot(eb$Amean, eb$sigma)
+plot(eb$Amean, eb$s2.post)
+```
+
+```{r, fig.height=8, fig.width=8, message=FALSE, echo=FALSE, eval=FALSE}
+x <- eb %>% biobroom::augment.MArrayLM() %>% ## ERROR in function!! s2.prior!!
+  inner_join(
+    inner_join(eb$Amean %>% 
+               as.tibble() %>% 
+               tibble::rownames_to_column() %>% 
+               dplyr::rename(.AMean=value,
+                             .gene=rowname),
+               eb$s2.post %>% 
+               as.tibble() %>% 
+               tibble::rownames_to_column() %>% 
+               dplyr::rename(s2.post=value,
+                             .gene=rowname),
+               by=".gene"),
+             by=".gene") 
+
+m <- x %>% 
+  ggplot(aes(.AMean,.sigma))+
+  geom_hex()+scale_y_continuous(limits = c(-0.2,3))
+  #geom_density2d()
+
+n <- x %>% 
+  ggplot(aes(.AMean,s2.post))+
+  geom_hex()+scale_y_continuous(limits = c(-0.2,3))
+  #geom_density2d()#
+
+o <- x %>% 
+  ggplot(aes(.AMean,.sigma))+
+  #geom_hex()+scale_y_continuous(limits = c(-0.2,9))
+  geom_density2d()#+
+  #scale_y_continuous(limits = c(-0.05,0.7))+
+  #scale_x_continuous(limits = c(-0.05,15))
+
+p <- x %>% 
+  ggplot(aes(.AMean,s2.post))+
+  #geom_hex()
+  geom_density2d()#+
+  #scale_y_continuous(limits = c(-0.05,0.7))+
+  #scale_x_continuous(limits = c(-0.05,15))
+
+Rmisc::multiplot(m,n,o,p,cols = 2)
+```
+
+
+
+#### p-value histogram
+
+```{r, echo=FALSE}
+test <- topTable(eb, coef = 2,
+                 sort.by ="P", 
+                 #sort.by ="AveExpr", 
+                 genelist = fit$genes$Gene.ID, number = Inf)
+library(ggplot2)
+ax <- qplot(test$P.Value, binwidth=.05)
+bx <- qplot(test$adj.P.Val, binwidth=.05)
+Rmisc::multiplot(ax,bx,cols = 2)
+```
+
+```{r, eval=FALSE, fig.align="center", echo=FALSE}
+
+#### base R volcano plot
+
+# (2) Volcano plot: Log Fold Change x -log10(p.value)
+#source: http://genomicsclass.github.io/book/pages/using_limma.html
+
+#
+par(mfrow=c(1,2))
+with(td, plot(logFC, -log10(P.Value),cex=.7, pch=20,
+                    main = "caso vs control",
+                    #col=cols,
+                    #xlim=c(-2,2), ylim=c(0,15),
+                    xlab="log Fold Change"))
+abline(h=c(-log10(0.05),-log10(1e-13)),
+       v=c(-1,1),
+       lty=2, col= "grey55")
+```
+
+
+#### volcano plot
+
+- OBJETIVO:
+    + Priorizar el __Tamaño del Efecto__ por la __significancia estadístistica__.
+
+```{r, eval=TRUE, echo=FALSE}
+#### heatmap + hierachical clustering
+eset <- ExpressionSet(assayData = exprs_norm, 
+                      phenoData = pheno_d)
+```
+
+```{r, fig.height=5, fig.width=6.5, echo=TRUE}
+# (2) Volcano plot: Log Fold Change x -log10(p.value)
+
+tv <- td %>% 
+  inner_join(biobroom::tidy.ExpressionSet(eset,addPheno = TRUE) %>% #count(gene)
+               group_by(gene,phenotype) %>% summarise(mean_group=mean(value)) %>% 
+               ungroup() %>% 
+               spread(phenotype,mean_group) %>% 
+               #arrange(desc(Asymptomatic)) %>% 
+               rename(Gene.ID=gene),
+             by="Gene.ID") 
+
+tv %>% 
+  mutate(significance=if_else(adj.P.Val<0.05,
+                              "adj.P.Val<0.05","diff rve")) %>% 
+  ggplot(aes(logFC,-log10(P.Value))) +
+  #geom_point(aes(colour=significance)) + scale_color_manual(values=c("red","black")) +
+  geom_point(aes(colour=Asymptomatic)) + viridis::scale_color_viridis() +
+  ggrepel::geom_text_repel(data = tv %>% 
+                             filter(adj.P.Val<0.05 & logFC>1.5 & Asymptomatic>1)# %>% 
+                             #arrange(desc(Asymptomatic)) %>% 
+                             #top_n(10,Asymptomatic)
+                           ,
+                           aes(label=Gene.ID)) +
+  labs(title="Malaria Protein microarray",
+       subtitle="Caso vs Control")+
+  geom_hline(aes(yintercept=-log10(0.01)), lty=3)+
+  geom_vline(aes(xintercept=1), lty=3)
+```
+
+### diff reactive
+
+#### boxplot
+
+```{r, fig.width=8,fig.height=6, eval=FALSE, echo=FALSE}
+#repro
+# #str()
+#  mutate(order=seq(from=n(),to=1)) 
+
+biobroom::tidy.ExpressionSet(eset,addPheno = TRUE) %>%
+  inner_join(tv %>% 
+               filter(adj.P.Val<0.05 & logFC>1 & Asymptomatic>1) %>% 
+               rename(gene="Gene.ID")
+    ,by="gene") %>% 
+  ggplot(aes(reorder(gene,logFC),value,fill=phenotype))+
+  geom_boxplot()+
+  #geom_point() +
+  ylab("log2-transformed normalized MFI")+
+  xlab("antigens")+
+  labs(title="Differentially reactive antigens",
+       subtitle="filtered by adj.P.Value<0.05 and logFC>1 sorted w.r.t. Fold Change")+
+  coord_flip() # ORDENAR eje de proteínas!!!!
+```
+
+```{r, fig.width=8,fig.height=6, eval=FALSE, echo=FALSE}
+#repro
+# #str()
+#  mutate(order=seq(from=n(),to=1)) 
+
+biobroom::tidy.ExpressionSet(eset,addPheno = TRUE) %>%
+  inner_join(tv %>% 
+               filter(adj.P.Val<0.05 & logFC>1 & Asymptomatic>1) %>% 
+               rename(gene="Gene.ID")
+    ,by="gene") %>% 
+  ggplot(aes(reorder(gene,Asymptomatic),value,fill=phenotype))+
+  geom_boxplot()+
+  #geom_point() +
+  ylab("log2-transformed normalized MFI")+
+  xlab("antigens")+
+  labs(title="Differentially reactive antigens",
+       subtitle="filtered by adj.P.Value<0.05 and logFC>1 sorted w.r.t. Asymptomatic median Ab reactivity")+
+  coord_flip() # ORDENAR eje de proteínas!!!!
+```
+
+#### list
+
+```{r}
+tv %>% 
+  filter(adj.P.Val<0.05 & logFC>1 & Asymptomatic>1) %>% 
+  arrange(desc(Asymptomatic)) %>% 
+  select(Gene.ID) %>% 
+  inner_join(ln, by="Gene.ID") %>% 
+  inner_join(biobroom::tidy.ExpressionSet(eset,addPheno = TRUE) %>% 
+               group_by(gene,phenotype) %>% summarise(mean_group=mean(value)) %>% 
+               ungroup() %>% 
+               spread(phenotype,mean_group) %>% 
+               rename(Gene.ID=gene),
+             by="Gene.ID") %>% 
+  inner_join(td %>% 
+               arrange(desc(t)) %>% 
+               mutate(t.order=seq(n())) %>% 
+               select(Gene.ID,AveExpr,P.Value,adj.P.Val,t.order),
+             by="Gene.ID") #%>% slice(1:10)
+```
+
+
+
+### top reactive
+
+- El grupo de antígenos con mayor reactividad permitirá darle una contexto biológico a los valores con significancia estadística.
+
+```{r, eval=TRUE, echo=FALSE}
+#### heatmap
+eset <- ExpressionSet(assayData = exprs_norm, 
+                      phenoData = pheno_d)
+```
+
+```{r, fig.height=7, fig.width=10, fig.align="center", echo=FALSE}
+#eset <- eset#leukemiasEset
+#exprs(eset) %>% dim()
+x <- td %>% 
+  #arrange(desc(t)) %>% 
+  arrange(desc(AveExpr)) %>% 
+  #filter(B>0 #& adj.P.Val<1e-4
+  #       ) %>% 
+  top_n(10,AveExpr) %>% 
+  select(Gene.ID) %>% as.matrix() 
+#x %>% dim()
+
+pData(eset) <- biobroom::tidy.ExpressionSet(eset,addPheno = TRUE) %>% 
+  group_by(sample) %>% summarise(sample_median=median(value)) %>% 
+  full_join(pData(eset) %>% 
+              rownames_to_column() %>% 
+              rename(sample=rowname),
+            by="sample") %>% 
+  arrange(phenotype,sample_median) %>%
+  as.data.frame() %>% 
+  column_to_rownames(var="sample")
+
+y <- pData(eset) %>% rownames_to_column() %>% 
+  select(rowname) %>% as.matrix() %>% as.character()
+
+eset <- eset[x,y]
+
+#aheatmap(exprs(eset)[x,], 
+#         Rowv = NA, Colv = NA, 
+#         annCol = pData(eset), 
+#         layout = "_")
+```
+
+#### boxplots
+
+- show the intensity distributions of selected features in both groups.
+
+```{r, fig.width=8,fig.height=2.5, echo=FALSE, eval=FALSE}
+#repro
+biobroom::tidy.ExpressionSet(eset,addPheno = TRUE) %>% #str()
+  ggplot(aes(reorder(gene,value,order = TRUE),value,fill=phenotype))+
+  geom_boxplot()+
+  #geom_point() +
+  ylab("log2-transformed normalized MFI")+
+  xlab("antigens")+
+  labs(title="Highly reactive antigens",
+       subtitle="top 10 sorted w.r.t. median Ab reactivity")+
+  coord_flip() # ORDENAR eje de proteínas!!!!
+```
+
+#### list
+
+```{r, echo=FALSE}
+x %>% as.data.frame() %>% 
+  mutate(Gene.ID=as.character(Gene.ID)) %>% 
+  inner_join(ln, by="Gene.ID") %>% 
+  inner_join(biobroom::tidy.ExpressionSet(eset,addPheno = TRUE) %>% 
+               group_by(gene,phenotype) %>% summarise(mean_group=mean(value)) %>% 
+               ungroup() %>% 
+               spread(phenotype,mean_group) %>% 
+               rename(Gene.ID=gene),
+             by="Gene.ID") %>% 
+  inner_join(td %>% 
+               arrange(desc(t)) %>% 
+               mutate(t.order=seq(n())) %>% 
+               select(Gene.ID,AveExpr,P.Value,adj.P.Val,t.order),
+             by="Gene.ID") #%>% slice(1:10)
+```
+
+### both
+
+#### heatmap
+
+```{r, fig.height=7, fig.width=6, fig.align="center"}
+eset <- ExpressionSet(assayData = exprs_norm, 
+                      phenoData = pheno_d)
+
+s <- tv %>% 
+  filter(adj.P.Val<0.05 & logFC>1 & Asymptomatic>1) %>% 
+  arrange(desc(Asymptomatic)) %>% 
+  select(Gene.ID) %>% as.matrix() 
+
+x <- tv %>% 
+  #arrange(desc(t)) %>% 
+  arrange(desc(AveExpr)) %>% 
+  #filter(B>0 #& adj.P.Val<1e-4
+  #       ) %>% 
+  top_n(10,AveExpr) %>% 
+  arrange(desc(Asymptomatic)) %>% # If diff order at boxplot is achieved, the deactivate this line.
+  select(Gene.ID) %>% as.matrix() 
+
+pData(eset) <- biobroom::tidy.ExpressionSet(eset,addPheno = TRUE) %>% 
+  group_by(sample) %>% summarise(sample_median=median(value)) %>% 
+  full_join(pData(eset) %>% 
+              rownames_to_column() %>% 
+              rename(sample=rowname),
+            by="sample") %>% 
+  arrange(phenotype,sample_median) %>%
+  as.data.frame() %>% 
+  column_to_rownames(var="sample")
+
+y <- pData(eset) %>% rownames_to_column() %>% 
+  select(rowname) %>% as.matrix() %>% as.character()
+
+eset <- eset[c(x,s),y]
+
+aheatmap(exprs(eset), 
+         Rowv = NA, Colv = NA, 
+         annCol = pData(eset), 
+         #layout = "_"
+         )
+```
+
+#### boxplot
+
+```{r, fig.width=6,fig.height=7.5, echo=TRUE}
+#repro
+biobroom::tidy.ExpressionSet(eset,addPheno = TRUE) %>% #count(gene)
+  full_join(biobroom::tidy.ExpressionSet(eset,addPheno = TRUE) %>% #count(gene)
+              group_by(gene,phenotype) %>% summarise(mean_group=mean(value)) %>% 
+              ungroup() %>% 
+              spread(phenotype,mean_group) %>% 
+              arrange(desc(Asymptomatic)) %>% 
+              select(-Symptomatic),
+            by="gene") %>% 
+  full_join(x %>% as.data.frame() %>% 
+              mutate(group="Top 10") %>% 
+              rename(gene="Gene.ID") %>% 
+              mutate(gene=as.character(gene)),
+            by="gene") %>% 
+  full_join(s %>% as.data.frame() %>% 
+              mutate(group="Differentially*") %>% 
+              rename(gene="Gene.ID") %>% 
+              mutate(gene=as.character(gene)),
+            by="gene") %>% 
+  unite(group, group.x, group.y) %>% 
+  mutate(group=stringr::str_replace(group,"NA_(.)", "\\1")) %>% 
+  mutate(group=stringr::str_replace(group,"(.)_NA", "\\1")) %>% 
+  mutate(group=forcats::fct_relevel(group,"Top 10")) %>% 
+  ggplot(aes(reorder(gene,Asymptomatic),value,fill=phenotype))+
+  geom_boxplot()+
+  #geom_point() +
+  facet_grid(group~.,scales = "free", space = "free") +#
+  ylab("log2-transformed normalized MFI")+
+  xlab("antigens")+
+  labs(title="Highly and differentially reactive antigens",
+       subtitle="All sorted w.r.t. Asymptomatic mean Ab reactivity",
+       caption="*filtered by adj.P.Val<0.05 and logFC>1")+
+  coord_flip() # ORDENAR eje de proteínas!!!!
+```
+
+### diff reactive (paper)
+
+- Los autores reportan todos los antígenos con __valor p ajustado menor a 0.05__
+- Dada la variabilidad entre las muestras por grupo, un algoritmo de clasificación no es la estrategia más adecuada.
+
+#### heatmap
+
+```{r, eval=TRUE, echo=FALSE}
+#### heatmap + hierachical clustering
+eset <- ExpressionSet(assayData = exprs_norm, 
+                      phenoData = pheno_d)
+```
+
+```{r, fig.height=7, fig.width=10, fig.align="center", eval=TRUE, echo=FALSE}
+x <- td %>% 
+  #arrange(desc(t)) %>% 
+  #arrange(desc(AveExpr)) %>% 
+  filter(adj.P.Val<0.05#B>0 #& adj.P.Val<1e-4
+         ) %>% 
+  inner_join(biobroom::tidy.ExpressionSet(eset,addPheno = TRUE) %>% 
+               group_by(gene,phenotype) %>% summarise(mean_group=mean(value)) %>% 
+               ungroup() %>% 
+               spread(phenotype,mean_group) %>% 
+               arrange(desc(Asymptomatic)) %>% 
+               rename(Gene.ID=gene),
+             by="Gene.ID") %>% 
+  arrange(desc(Asymptomatic)) %>% 
+  filter(Symptomatic>0) %>% #top_n(30,Asymptomatic)
+  select(Gene.ID) %>% as.matrix() 
+#x %>% dim()
+
+pData(eset) <- biobroom::tidy.ExpressionSet(eset,addPheno = TRUE) %>% 
+  group_by(sample) %>% summarise(sample_median=median(value)) %>% 
+  full_join(pData(eset) %>% 
+              rownames_to_column() %>% 
+              rename(sample=rowname),
+            by="sample") %>% 
+  arrange(phenotype,sample_median) %>%
+  as.data.frame() %>% 
+  column_to_rownames(var="sample")
+
+y <- pData(eset) %>% rownames_to_column() %>% 
+  select(rowname) %>% as.matrix() %>% as.character()
+
+eset <- eset[x,y]
+
+#aheatmap(exprs(eset)[x,], 
+#         Rowv = TRUE, Colv = NA, 
+#         annCol = pData(eset), 
+#         layout = "_")
+```
+
+```{r, fig.width=8,fig.height=5, eval=FALSE, echo=FALSE}
+#### boxplots
+#- show the intensity distributions of selected features in both groups.
+
+# ¿HOW TO EXTRACT HE CLUSTERING ORDER?
+
+#repro
+biobroom::tidy.ExpressionSet(eset,addPheno = TRUE) %>% #str()
+  ggplot(aes(reorder(gene,value,order = TRUE),value,fill=phenotype))+
+  geom_boxplot()+
+  #geom_point() +
+  ylab("log2-transformed normalized MFI")+
+  xlab("antigens")+
+  labs(title="Differentially reactive antigens",
+       subtitle="filtered by B>0 (~adj.P.Val<0.01), and sorted w.r.t. median Ab reactivity")+
+  coord_flip() # ORDENAR eje de proteínas!!!!
+```
+
+
+```{r, fig.height=12, fig.width=8, fig.align="center"}
+aheatmap(exprs(eset)[x,], 
+         Rowv = NA, Colv = NA, 
+         annCol = pData(eset), 
+         #layout = "_"
+         )
+```
+
+#### boxplots
+
+- Una mejor estrategia de visualización son los diagramas de cajas, los cuales grafican la distribución total de las observaciones.
+
+```{r, fig.width=8,fig.height=11}
+#repro
+biobroom::tidy.ExpressionSet(eset,addPheno = TRUE) %>% #str()
+  mutate(order=seq(from=n(),to=1)) %>% 
+  ggplot(aes(reorder(gene,order,order=TRUE),value,fill=phenotype))+
+  geom_boxplot()+
+  #geom_point() +
+  ylab("log2-transformed normalized MFI")+
+  xlab("antigens")+
+  labs(title="Differentially reactive antigens",
+       subtitle="filtered by adj.P.Value<0.05 and sorted w.r.t. Asymptomatic median Ab reactivity")+
+  coord_flip() # ORDENAR eje de proteínas!!!!
+```
+
+#### list
+
+```{r}
+x %>% as.data.frame() %>% 
+  mutate(Gene.ID=as.character(Gene.ID)) %>% 
+  inner_join(ln, by="Gene.ID") %>% 
+  inner_join(biobroom::tidy.ExpressionSet(eset,addPheno = TRUE) %>% 
+               group_by(gene,phenotype) %>% summarise(mean_group=mean(value)) %>% 
+               ungroup() %>% 
+               spread(phenotype,mean_group) %>% 
+               rename(Gene.ID=gene),
+             by="Gene.ID") %>% 
+    inner_join(td %>% 
+               arrange(desc(t)) %>% 
+               mutate(t.order=seq(n())) %>% 
+               select(Gene.ID,P.Value,adj.P.Val,t.order),
+             by="Gene.ID") #%>% slice(1:8)
+```
+
+<!--
+
+### B-stat >0
+
+- Here, all features are filtered by __positive log-odds__ that the gene is differentially expressed (B=0 ~ 50% probability a gene is differentially expressed).
+- __B-statistic__ is adjusted for multiple testing by assuming that 1% of the genes (modifiable parameter) are expected to be differentially expressed.
+- Depends on normality (same as p-values), and independence between genes (same as BH control of FDR), but require in addition a prior guess for the proportion of differentially expressed probes.
+- __p-values__ may be preferred to the B-statistics because they do not require this prior knowledge.
+
+#### sorted by significance
+
+```{r, eval=TRUE, echo=FALSE}
+##### heatmap
+eset <- ExpressionSet(assayData = exprs_norm, 
+                      phenoData = pheno_d)
+```
+
+```{r, fig.height=7, fig.width=10, fig.align="center", echo=FALSE}
+#eset <- eset#leukemiasEset
+#exprs(eset) %>% dim()
+x <- td %>% 
+  arrange(desc(t)) %>% 
+  #arrange(desc(AveExpr)) %>% 
+  filter(B>0 #& adj.P.Val<1e-4
+         ) %>% 
+  select(Gene.ID) %>% as.matrix() 
+#x %>% dim()
+
+pData(eset) <- biobroom::tidy.ExpressionSet(eset,addPheno = TRUE) %>% 
+  group_by(sample) %>% summarise(sample_median=median(value)) %>% 
+  full_join(pData(eset) %>% 
+              rownames_to_column() %>% 
+              rename(sample=rowname),
+            by="sample") %>% 
+  arrange(phenotype,sample_median) %>%
+  as.data.frame() %>% 
+  column_to_rownames(var="sample")
+
+y <- pData(eset) %>% rownames_to_column() %>% 
+  select(rowname) %>% as.matrix() %>% as.character()
+
+eset <- eset[x,y]
+
+#aheatmap(exprs(eset)[x,], 
+#         Rowv = NA, Colv = NA, 
+#         annCol = pData(eset), 
+#         layout = "_")
+```
+
+##### boxplots
+
+- show the intensity distributions of selected features in both groups.
+
+```{r, fig.width=8,fig.height=5, echo=FALSE, eval=FALSE}
+#repro
+biobroom::tidy.ExpressionSet(eset,addPheno = TRUE) %>% #str()
+  mutate(order=seq(from=n(),to=1)) %>% 
+  ggplot(aes(reorder(gene,order,order=TRUE),value,fill=phenotype))+
+  geom_boxplot()+
+  #geom_point() +
+  ylab("log2-transformed normalized MFI")+
+  xlab("antigens")+
+  labs(title="Differentially reactive antigens",
+       subtitle="filtered by B>0 (~adj.P.Val<0.01), and sorted w.r.t. P.Value")+
+  coord_flip() # ORDENAR eje de proteínas!!!!
+```
+
+##### list
+
+```{r, echo=FALSE, eval=FALSE}
+x %>% as.data.frame() %>% 
+  mutate(Gene.ID=as.character(Gene.ID)) %>% 
+  inner_join(ln, by="Gene.ID") %>% 
+  inner_join(biobroom::tidy.ExpressionSet(eset,addPheno = TRUE) %>% 
+               group_by(gene,phenotype) %>% summarise(mean_group=mean(value)) %>% 
+               ungroup() %>% 
+               spread(phenotype,mean_group) %>% 
+               rename(Gene.ID=gene),
+             by="Gene.ID") %>% 
+    inner_join(td %>% 
+               arrange(desc(t)) %>% 
+               mutate(t.order=seq(n())) %>% 
+               select(Gene.ID,P.Value,adj.P.Val,t.order),
+             by="Gene.ID") #%>% slice(1:10)
+```
+
+
+#### sorted by average
+
+```{r, eval=TRUE, echo=FALSE}
+##### heatmap
+eset <- ExpressionSet(assayData = exprs_norm, 
+                      phenoData = pheno_d)
+```
+
+```{r, fig.height=7, fig.width=10, fig.align="center", echo=FALSE}
+#eset <- eset#leukemiasEset
+#exprs(eset) %>% dim()
+x <- td %>% 
+  #arrange(desc(t)) %>% 
+  arrange(desc(AveExpr)) %>% 
+  filter(B>0 #& adj.P.Val<1e-4
+         ) %>% 
+  select(Gene.ID) %>% as.matrix() 
+#x %>% dim()
+
+pData(eset) <- biobroom::tidy.ExpressionSet(eset,addPheno = TRUE) %>% 
+  group_by(sample) %>% summarise(sample_median=median(value)) %>% 
+  full_join(pData(eset) %>% 
+              rownames_to_column() %>% 
+              rename(sample=rowname),
+            by="sample") %>% 
+  arrange(phenotype,sample_median) %>%
+  as.data.frame() %>% 
+  column_to_rownames(var="sample")
+
+y <- pData(eset) %>% rownames_to_column() %>% 
+  select(rowname) %>% as.matrix() %>% as.character()
+
+eset <- eset[x,y]
+
+#aheatmap(exprs(eset)[x,], 
+#         Rowv = NA, Colv = NA, 
+#         annCol = pData(eset), 
+#         layout = "_")
+```
+
+##### boxplots
+
+- show the intensity distributions of selected features in both groups.
+
+```{r, fig.width=8,fig.height=5, echo=FALSE, eval=FALSE}
+#repro
+biobroom::tidy.ExpressionSet(eset,addPheno = TRUE) %>% #str()
+  ggplot(aes(reorder(gene,value,order = TRUE),value,fill=phenotype))+
+  geom_boxplot()+
+  #geom_point() +
+  ylab("log2-transformed normalized MFI")+
+  xlab("antigens")+
+  labs(title="Differentially reactive antigens",
+       subtitle="filtered by B>0 (~adj.P.Val<0.01), and sorted w.r.t. median Ab reactivity")+
+  coord_flip() # ORDENAR eje de proteínas!!!!
+```
+
+##### list
+
+```{r, echo=FALSE, eval=FALSE}
+x %>% as.data.frame() %>% 
+  mutate(Gene.ID=as.character(Gene.ID)) %>% 
+  inner_join(ln, by="Gene.ID") %>% 
+  inner_join(biobroom::tidy.ExpressionSet(eset,addPheno = TRUE) %>% 
+               group_by(gene,phenotype) %>% summarise(mean_group=mean(value)) %>% 
+               ungroup() %>% 
+               spread(phenotype,mean_group) %>% 
+               rename(Gene.ID=gene),
+             by="Gene.ID") %>% 
+    inner_join(td %>% 
+               arrange(desc(t)) %>% 
+               mutate(t.order=seq(n())) %>% 
+               select(Gene.ID,P.Value,adj.P.Val,t.order),
+             by="Gene.ID") #%>% slice(1:10)
+```
+
+-->
+
+## Conclusión: aplica el `tidyverse` antes y después de `Bioconductor`
+
+- Al igual que en los casos presentados en los tutoriales anteriores, el dialecto del `tidyverse` facilitó tanto el ingreso de data para la ejecución de modelos en `Bioconductor`, como para "limpiar" sus resultados y generar en forma intuitiva visualizaciones que ayuden a su interpretación.
+
+- El análisis presentado sigue el flujo de trabajo propuesto por David Robinson:
+
+![workflow](figure/tidy_01.jpg)
+
+## EXTRA TOOL: `biobroom` y `ExpressionSet_tidiers`
+
+- `biobroom` incluye "tidiers" para varias estructuras de datos de Bioconductor. Revísalo [aquí](http://bioconductor.org/packages/release/bioc/vignettes/biobroom/inst/doc/biobroom_vignette.html).
+
+- ¿Tarea? Ponerlo en práctica con sus ejemplos de RNA-seq :)
+
+```{r}
+#exprs(eset)
+#pData(eset) %>% rownames_to_column() %>% arrange(phenotype)
+biobroom::tidy.ExpressionSet(eset,addPheno = TRUE)
+```
+
+## Computer environment
+```{r}
+devtools::session_info()
+```
+
+## References

@@ -1,0 +1,337 @@
+---
+title: "Caso II: Limpieza de Modelos en Biología Computacional"
+author: "avallecam"
+date: '`r Sys.Date()`'
+output:
+  #html_document:
+  #pdf_document:
+  html_notebook:
+    toc: yes
+    toc_depth: 4
+    toc_float:
+      collapsed: yes
+    #theme: united
+    #code_folding: "hide"
+    #fig_caption: TRUE
+    #number_sections: TRUE
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+options(width = 90) # expand limits of CONSOLE output
+```
+
+El presente tutorial está basado en la 
+[publicación](http://varianceexplained.org/r/tidy-genomics-biobroom/#fnref:spread) del 
+blog [variance explained](http://varianceexplained.org/) 
+de [David Robinson](https://twitter.com/drob).
+El material ha sido actualizado y adaptado al objetivo del curso.
+
+## Objetivo
+
+- Integrar las herramientas del `tidyverse` con los flujos de trabajo de `Bioconductor` para el análisis de microarreglos.
+
+__Nota:__ Todos los outputs deben verse como líneas corridas. _Disminuir el zoom de ser necesario._
+
+## Contexto
+
+___tidy data_ no lo es todo.__
+
+- From the posts so far, one might get the impression that I think data must be tidy at every stage of an analysis. Not true! That would be an absurd and unnecessary constraint. Lots of mathematical operations are faster on matrices, such as singular value decomposition or linear regression. Jeff Leek rightfully points this out as an issue with my previous modeling gene expression post, where he remarks that the limma package is both faster and takes more statistical considerations (pooling variances among genes) into account.
+
+- Isn’t it contradictory to do these kinds of operations in a tidy analysis? Not at all. My general recommendation is laid out as follows:
+
+![workflow](figure/tidy_01.jpg)
+
+- As long as you’re in that Models “cloud”, you can store your data in whatever way is computationally and practically easiest. However:
+    
+    - __Before you model__, you should use tidy tools to clean, process and wrangle your data (as shown in previous posts)
+    - __After you’ve performed your modeling__, you should turn the model into a tidy output for interpretation, visualization, and communication
+
+- This requires a new and important tool in our series on tidy bioinformatics analysis: __the `biobroom` package__, written and maintained by my former colleagues, particularly Andy Bass and John Storey. In this post I’ll show how to use the __`limma` and `biobroom` packages__ in combination to continue a tidy analysis, and consider __when and how to use non-tidy data in an analysis__.
+
+## Dependencies
+```{r, message=FALSE,warning=FALSE}
+library(tidyverse)
+```
+
+## Importe y limpieza de datos
+
+```{r}
+original_data <- readRDS("data-raw/tidymicro.rds")
+
+cleaned_data <- original_data %>%
+  separate(NAME, c("name", "BP", "MF", "systematic_name", "number"), sep = "\\|\\|") %>%
+  mutate_at(vars(name:systematic_name), funs(trimws)) %>%
+  select(-number, -GID, -YORF, -GWEIGHT) %>%
+  gather(sample, expression, G0.05:U0.3) %>% #dplyr::count(sample)
+  separate(sample, c("nutrient", "rate"), sep = 1, convert = TRUE) %>% 
+  mutate(nutrient=forcats::fct_recode(nutrient, 
+                                      "Glucose" = "G", "Leucine" = "L",
+                                      "Phosphate" = "P", "Sulfate" = "S",
+                                      "Ammonia" = "N", "Uracil" = "U")) %>% 
+  filter(!is.na(expression),systematic_name!="") %>% 
+  group_by(systematic_name, nutrient) %>%
+  filter(n()==6) %>% 
+  ungroup() %>% 
+  glimpse()
+```
+
+- `plot_expression_data` function
+
+```{r}
+plot_expression_data <- function(expression_data) {
+  ggplot(expression_data, aes(rate, expression, color = nutrient)) +
+    geom_point() +
+    geom_smooth(method = "lm", se = FALSE) +
+    facet_wrap(~name + systematic_name, scales = "free_y")
+}
+```
+
+
+## limma
+
+__Aplicación de regresión lineal por observación__
+
+- Why a computational biologist should not run a gene expression analysis with traditional statistics?
+    
+    - __Performing thousands of linear regressions with separate `lm` calls is slow.__ It takes about a minute on my computer. There are computational shortcuts we can take when all of our data is in the form of a _gene-by-sample matrix_.
+    - __We’re not taking statistical advantage of the shared information.__ Modern bioinformatics approaches often _“share power” across genes, by pooling variance estimates_. The approach in the limma package is one notable example for __microarray data__, and __RNA-Seq tools__ like `edgeR` and `DESeq2` take a similar approach in their negative binomial models.
+
+- We’d like to __take advantage of the sophisticated biological modeling tools in `Bioconductor`__. We’re thus going to __convert__ our data into a non-tidy format (a gene by sample matrix), and __run it through limma__ to create a linear model for each gene. Then when we want to visualize, compare, or otherwise manipulate our models, we’ll __tidy the model__ output using biobroom.
+
+### Setup
+
+- Most gene expression packages in `Bioconductor` expect data to be in a __matrix__ with __one row per gene and one column per sample__. We would like to __fit one model for each gene and nutrient combination__. So let’s set it up that way using reshape2’s `acast()`
+
+(We could have used tidyr’s `spread` function, but `acast` actually saves us a few steps by giving us a matrix with rownames, rather than a data frame, right away.)
+
+```{r, message=FALSE}
+library(reshape2)
+exprs <- acast(cleaned_data, systematic_name + nutrient ~ rate,
+               value.var = "expression")
+
+head(exprs)
+```
+
+- We then need to extract the __experiment design__, which in this case is just the growth rate:
+```{r}
+rate <- as.numeric(colnames(exprs))
+rate
+```
+
+- __`limma` (“linear modeling of microarrays”)__ is one of the most popular `Bioconductor` packages for performing __linear-model based differential expression analyses on microarray data__. With the data in this matrix form, we’re ready to use it:
+
+```{r}
+library(limma)
+
+# linear model structure: 
+# lmFit(data_matrix, experiment_design)
+
+# check the experiment_design: 
+# model.matrix(~rate)
+
+fit <- lmFit(exprs, model.matrix(~rate))
+eb <- eBayes(fit)
+```
+
+- This performs a __linear regression for each gene__. This operation is both _faster_ and more _statistically sophisticated_ than `lm`.
+
+- So now we’ve performed our regression. What output do we get?
+```{r}
+#class(fit)
+#summary(fit)
+class(eb)
+summary(eb)
+```
+
+- That’s a lot of outputs, and many of them are matrices of varying shapes. If you want to work with this using __tidy tools__ (and if you’ve been listening, you hopefully do), we need to tidy it:
+
+### Tidy model
+
+```{r, message=FALSE}
+library(biobroom)
+head(tidy(eb, intercept = TRUE))
+```
+
+- Notice that this is now in __one-row-per-coefficient-per-gene__ form, much like the output of broom’s tidy() on linear models.
+
+- Like broom, `biobroom` always returns a table without rownames that __we can feed into standard tidy tools like `dplyr` and `ggplot2`__. (Note that unlike broom, biobroom requires an intercept = TRUE argument to leave the intercept term, simply because in many genomic datasets- though not ours- the intercept term is almost meaningless). `biobroom` can also tidy model objects from other tools like `edgeR` or `DESeq2`, always giving a consistent format similar to this one.
+
+- Now all we’ve got to do __split the systematic name and nutrient back up__. tidyr’s `separate()` can do this:
+
+```{r}
+td <- eb %>% 
+  biobroom::tidy.MArrayLM(intercept = TRUE) %>% 
+  separate(gene, c("systematic_name","nutrient"), sep="_") %>% glimpse()
+```
+
+### Analyse tidy model
+
+- Notice that there are two rows for each gene-nutrient combination: an __intercept__ and a __slope__ term. This is simplifying each gene-nutrient combination into two values:
+    
+    - __Intercept:__ How highly expressed the gene is when it’s starved of that nutrient.
+    - __rate:__ How much the gene’s expression responds to an increasing supply of that nutrient (and therfore an increasing growth rate)
+
+```{r}
+td %>% count(term)
+```
+
+- We’ll take a brief look at those one at a time.
+
+#### Intercepts
+```{r}
+intercept_terms <- td %>% filter(term=="(Intercept)") 
+
+intercept_terms %>% head()
+```
+
+- The p-values aren’t actually interesting to us here: _they’re testing whether the intercept is equal to 0_, which is not a particularly special number in terms of these normalized gene expressions. (Confidence intervals and standard errors would be).
+
+- What we’re really interested in is the __value of each intercept relative to the other nutrients in that gene__. For example, let’s again consider our favorite gene, LEU1.
+
+```{r}
+cleaned_data %>% 
+  filter(name=="LEU1") %>% 
+  ggplot(aes(rate,expression,colour=nutrient))+
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE)+
+  geom_hline(aes(yintercept=mean(expression)),linetype="dashed")
+```
+
+- This gene has a low intercept term for all nutrients except leucine. I’ve marked the average intercept with a horizontal dashed line to demonstrate this. Suppose we want to look for other genes like this, with a single outlying intercept term. We could do this by _centering_ the intercepts around the average for each gene, __using a `group_by` and `mutate`__:
+
+```{r}
+centered_intercepts <- intercept_terms %>%
+  group_by(systematic_name) %>%
+  mutate(centered_intercept = estimate - mean(estimate)) %>%
+  ungroup()
+```
+
+- Now we are interested in the __most extreme cases__, where the intercept is very far from the other nutrients. The `top_n` function is useful for this.
+
+```{r}
+top_intercept <- centered_intercepts %>%
+  top_n(20, centered_intercept)
+```
+
+- Note that here I’m looking for __cases where a single nutrient was greatly _overexpressed_ in starvation__ (to look for underexpressed nutrients, we could have used `-centered_intercept` instead). We can then pull these genes out of the original data with the useful `semi_join`, at which point we can __graph it__ with our `plot_expression_data` function:
+
+```{r, fig.height=10, fig.width=10}
+cleaned_data %>%
+  semi_join(top_intercept, by = "systematic_name") %>%
+  plot_expression_data()
+```
+- These certainly do look like interesting genes! We notice that some genes, like PHO11, only one nutrient is highly expressed while the rest show low expression, while other genes, such as ADH2, show varying levels of expression for each nutrient. We also notice that in most cases the highly expressed nutrient is moving back down towards the others as growth rate increases (that is, as the yeast is less starved). This makes sense, since it’s the starvation that is eliciting the unusual behavior.
+
+- What do these genes do? Beats me; I’m not a biologist, I just play one on my degree. But it certainly looks promising that PHO11 and PHO12 are both much higher expressed when phosphorus is the limiting nutrient, as well as SUL1 when sulfur is rare- and indeed each gene is involved in transport of that nutrient. (And we do see our Gene of the Week, LEU1).
+
+- Looking up the others in yeastgenome.org, we see that a lot of them are involved in transport across membranes (e.g. DAL5, GAP1, QDR2). This makes sense: the cell notices that it is missing a nutrient, and puts more energy into importing it. Notice that this would be a great way to make inferences about genes whose function we don’t yet know. (This is the focus of functional genomics).
+
+#### Slopes
+
+- Now let’s take a look at the slope terms, which shows whether each gene __increased or decreased its growth rate in a particular condition__.
+
+```{r}
+slope_terms <- td %>% filter(term=="rate") 
+
+slope_terms %>% head()
+```
+
+- Here, we’ll focus a bit more on __statistical significance__. First we can make a histogram of the p-values. These p-values are spread across six different nutrients, so we’ll facet our histogram by those nutrients:
+
+```{r}
+ggplot(slope_terms, aes(p.value)) +
+  geom_histogram(binwidth = .05) +
+  facet_wrap(~nutrient)
+```
+
+* [link](http://varianceexplained.org/statistics/interpreting-pvalue-histogram/) para el post de @drob para la interpretación de histogramas de p_values
+
+- In this case, we can see that the tests are generally well-behaved, with a mix of nulls (genes that don’t respond to growth rate) and alternatives (genes that do). Thus, we can use p-value correction to identify significant genes.
+
+<!-- We can now use the tidy approaches to visualization and interpretation that were explored in previous posts. We could create a p-value histogram -->
+
+```{r, eval=FALSE, echo=FALSE}
+ggplot(td, aes(p.value)) +
+  geom_histogram() +
+  facet_grid(term ~ nutrient, scales = "free_y")
+```
+
+- Or make a __volcano plot__, comparing statistical significance to effect size (here let’s say just on the slope terms):
+
+```{r}
+td %>%
+  filter(term == "rate") %>%
+  ggplot(aes(estimate, p.value)) +
+  geom_point() +
+  facet_wrap(~ nutrient, scales = "free") +
+  scale_y_log10() 
+```
+
+- We could easily perform for __multiple hypothesis testing__ within each group, and filter for significant (say, FDR < 1%) changes:
+```{r}
+td_filtered <- td %>%
+  group_by(term, nutrient) %>%
+  mutate(fdr = p.adjust(p.value, method = "fdr")) %>%
+  ungroup() %>%
+  filter(fdr < .01)
+```
+
+Or finding the __top few significant changes in each group__ using dplyr’s `top_n`:
+```{r}
+top_3 <- td_filtered %>%
+  filter(term == "rate") %>%
+  group_by(nutrient) %>%
+  top_n(3, abs(estimate))
+
+top_3
+```
+
+- We could __join__ this with our original data, which would let us __visualize the trends for only the most significant genes__:
+
+```{r, fig.height=10, fig.width=10}
+top_3 %>%
+  rename(significant_nutrient = nutrient) %>%
+  inner_join(cleaned_data, by = "systematic_name") %>%
+  mutate(highlight = nutrient == significant_nutrient) %>%
+  ggplot(aes(rate, expression, color = nutrient)) +
+  geom_point() +
+  geom_smooth(aes(lty = !highlight), method = "lm", se = FALSE, show.legend = FALSE) +
+  facet_wrap(significant_nutrient ~ systematic_name, ncol = 3, scales = "free_y")
+```
+
+- In short, you can once again use the suite of __“tidy tools”__ that we’ve found __powerful in genomic analyses__.
+
+## Conclusion: La data está bajo tu poder
+
+- There’s a classic proverb of computer science from __Abelman & Sussman: “Programs must be written for people to read, and only incidentally for machines to execute.”__ I’d say this is even more true for data it is for code. Data scientists need to be very comfortable engaging with their data, not fighting with the representation.
+
+## EXTRA: Gene-sets
+
+- These per-gene models can still be difficult to interpret biologically if you’re not familiar with the functions of specific genes. What we really want is a way to summarize the results into “genes involved in this biological process changed their expression.” This is where annotations of gene sets become useful.
+
+```{r}
+gene_sets <- distinct(cleaned_data, systematic_name, BP, MF)
+
+td %>%
+  inner_join(gene_sets) %>%
+  filter(BP == "leucine biosynthesis", term == "(Intercept)") %>%
+  mutate(nutrient = reorder(nutrient, estimate, median)) %>%
+  ggplot(aes(nutrient, estimate)) +
+  geom_boxplot() +
+  geom_point() +
+  geom_text(aes(label = systematic_name), vjust = 1, hjust = 1) +
+  xlab("Limiting nutrient") +
+  ylab("Intercept (expression at low concentration)") +
+  ggtitle("Genes involved in leucine biosynthesis")
+```
+
+- Notice how clear it is that these genes respond to leucine starvation in particular. This can be applied to gene sets containing dozens or even hundreds of genes while still making the general trend apparent. Furthermore, we could use these summaries to look at many gene sets at once, and even use statistical tests to discover new gene sets that respond to starvation.
+
+## Computer environment
+```{r}
+devtools::session_info()
+```
+
+## References
